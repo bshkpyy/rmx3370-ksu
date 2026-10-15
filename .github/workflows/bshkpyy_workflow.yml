@@ -34,10 +34,15 @@ on:
         default: 'https://github.com/realme-kernel-opensource/realme_GTneo2-Q5pro-GTMasterExploratory-AndroidT-kernel-source.git'
         type: string
       defconfig_override:
-        description: '手动指定 defconfig 相对路径 (留空=自动探测)'
+        description: '手动指定 defconfig (相对 arch/arm64/configs/)。留空=自动探测 vendor/kona-perf_defconfig'
         required: false
         default: ''
         type: string
+      disable_gcc_wrapper:
+        description: '禁用 OPLUS 遗留的 Python2 gcc-wrapper.py (必开, 否则 defconfig 阶段就崩)'
+        required: true
+        default: true
+        type: boolean
       use_ccache:
         description: '启用 ccache 加速'
         required: true
@@ -533,6 +538,162 @@ jobs:
           python3 /tmp/ksu_patch.py
 
       # ----------------------------------------------------------------------
+      # 6.5 修复 OPLUS 源码树的已知障碍
+      #
+      #     障碍 A: scripts/gcc-wrapper.py 是 Python 2 脚本
+      #             print "..." 这种语句在 Python 3 下必然 SyntaxError。
+      #             Ubuntu 22.04 runner 只有 Python 3, 于是 defconfig 阶段就崩:
+      #               File "scripts/gcc-wrapper.py", line 29
+      #                 def ... : SyntaxError: invalid syntax
+      #             解法: 直接改名让 kbuild 用不到它 (4.19 不依赖它做编译)
+      #
+      #     障碍 B: init/Kconfig 里 source "kernel/sched_assist/Kconfig" 等路径
+      #             在浅克隆 (--depth=1) 或子模块缺失时不存在, 导致:
+      #               init/Kconfig:772: can't open file "kernel/sched_assist/Kconfig"
+      #             解法: 为缺失的 Kconfig 生成占位文件
+      # ----------------------------------------------------------------------
+      - name: 6.5 修复 OPLUS 源码树障碍 (Python2 wrapper / 缺失 Kconfig)
+        working-directory: ${{ github.workspace }}/oplus/kernel/msm-4.19
+        run: |
+          set -ux
+          RC=0
+
+          # ---------------- 障碍 A: gcc-wrapper.py ----------------
+          if [ "${{ inputs.disable_gcc_wrapper }}" = "true" ]; then
+            for w in scripts/gcc-wrapper.py scripts/gcc-wrapper2.py scripts/ld-wrapper.py; do
+              [ -f "$w" ] || continue
+              echo ">>> 处理 Python2 遗留 wrapper: $w"
+
+              # 先做内容级 Py2 -> Py3 转换 (print 语句 / except 语法 / xrange)
+              python3 - "$w" <<'PYFIX' || true
+          import re, sys, io
+
+          path = sys.argv[1]
+          with io.open(path, 'r', encoding='utf-8', errors='ignore') as f:
+              src = f.read()
+
+          orig = src
+
+          # 1) print "xxx"  /  print "xxx", var   ->  print("xxx", var)
+          def fix_print(m):
+              indent, rest = m.group(1), m.group(2).rstrip()
+              if rest.startswith('('):
+                  return m.group(0)          # 已经是函数调用
+              if rest.startswith('>>'):
+                  # print >>sys.stderr, "msg"
+                  mm = re.match(r'>>\s*([^,]+)\s*,\s*(.*)$', rest)
+                  if mm:
+                      return '%sprint(%s, file=%s)' % (indent, mm.group(2), mm.group(1).strip())
+                  return m.group(0)
+              # 顶层逗号分隔的多个表达式 -> 元组传参
+              return '%sprint(%s)' % (indent, rest)
+
+          src = re.sub(r'(?m)^([ \t]*)print\s+(.+)$', fix_print, src)
+
+          # 2) except X, e:  ->  except X as e:
+          src = re.sub(r'(?m)^([ \t]*)except\s+([^:\n]+?)\s*,\s*(\w+)\s*:',
+                       r'\1except \2 as \3:', src)
+
+          # 3) xrange -> range
+          src = re.sub(r'\bxrange\b', 'range', src)
+
+          # 4) 移除仅为 py2 存在的编码声明冲突 (保留 utf-8)
+          src = re.sub(r'#!.*python2', '#!/usr/bin/env python3', src)
+
+          if src != orig:
+              with io.open(path, 'w', encoding='utf-8') as f:
+                  f.write(src)
+              print('    [Py3-Fixed] 已转换 Python2 语法')
+          else:
+              print('    [Py3-Fixed] 无需转换')
+          PYFIX
+
+              # 验证转换结果能否被 Python3 解析
+              if python3 -c "import ast,io,sys; ast.parse(io.open(sys.argv[1],encoding='utf-8',errors='ignore').read())" "$w" 2>/dev/null; then
+                echo "    [OK] $w 现在可被 Python3 解析"
+              else
+                echo "    [WARN] $w 仍无法被 Python3 解析, 改为禁用 (.disabled)"
+                mv "$w" "$w.disabled"
+              fi
+            done
+
+            # 给 py2-only wrapper 提供 python2 兜底 (某些树 Makefile 硬引用)
+            if ! command -v python2 >/dev/null 2>&1; then
+              mkdir -p "$HOME/.local/bin"
+              cat > "$HOME/.local/bin/python2" <<'SHIM'
+          #!/bin/sh
+          exec python3 "$@"
+          SHIM
+              chmod +x "$HOME/.local/bin/python2"
+              export PATH="$HOME/.local/bin:$PATH"
+              echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+              echo ">>> 已放置 python2 -> python3 shim (兜底)"
+            fi
+          fi
+
+          # ---------------- 障碍 B: 缺失的 Kconfig ----------------
+          echo ">>> 扫描 init/Kconfig 中的 source 引用..."
+          MISSING=0
+          while read -r kc; do
+            [ -z "$kc" ] && continue
+            if [ ! -f "$kc" ]; then
+              echo "  [缺失] $kc -> 生成占位 Kconfig"
+              d=$(dirname "$kc")
+              mkdir -p "$d"
+              {
+                echo "# 自动生成的占位 Kconfig (原始文件在源码树中缺失)"
+                echo "# 来源: 由 CI 脚本补齐, 以避免 kbuild 因 source 失败而中断"
+                echo ""
+                echo "# 保持文件非空, 且不含任何 config 项"
+              } > "$kc"
+              MISSING=$((MISSING+1))
+            fi
+          done < <(grep -oE 'source[[:space:]]+"[^"]+"' init/Kconfig 2>/dev/null \
+                   | sed -E 's/^source[[:space:]]+"([^"]+)"$/\1/' \
+                   | grep -v '^\.\./' || true)
+
+          echo ">>> init/Kconfig 补齐缺失文件数: $MISSING"
+
+          # ---------------- 障碍 B2: 递归扫其它顶层 Kconfig ----------------
+          echo ">>> 递归扫描 Kconfig 缺失引用..."
+          MISSING2=0
+          for topkc in Kconfig arch/arm64/Kconfig init/Kconfig kernel/Kconfig drivers/Kconfig fs/Kconfig; do
+            [ -f "$topkc" ] || continue
+            bd=$(dirname "$topkc")
+            while read -r kc; do
+              [ -z "$kc" ] && continue
+              case "$kc" in ../*|/*) continue ;; esac
+              full="$bd/$kc"
+              if [ ! -f "$full" ]; then
+                mkdir -p "$(dirname "$full")"
+                {
+                  echo "# 自动生成的占位 Kconfig"
+                  echo ""
+                } > "$full"
+                MISSING2=$((MISSING2+1))
+              fi
+            done < <(grep -oE 'source[[:space:]]+"[^"]+"' "$topkc" 2>/dev/null \
+                     | sed -E 's/^source[[:space:]]+"([^"]+)"$/\1/' || true)
+          done
+          echo ">>> 递归补齐数: $MISSING2"
+
+          # ---------------- 障碍 C: 校验 gcc-version.sh 可执行 ----------------
+          if [ -f scripts/gcc-version.sh ] && [ ! -x scripts/gcc-version.sh ]; then
+            echo ">>> 修复 scripts/gcc-version.sh 执行位"
+            chmod +x scripts/gcc-version.sh
+          fi
+
+          # ---------------- 障碍 D: python2 兜底 ----------------
+          if command -v python2 >/dev/null 2>&1; then
+            echo ">>> python2 可用: $(python2 --version 2>&1)"
+          else
+            echo ">>> python2 不可用 (已通过禁用 wrapper 规避)"
+          fi
+
+          echo ">>> 6.5 完成, 继续流程"
+          exit $RC
+
+      # ----------------------------------------------------------------------
       # 7. defconfig 定位与 KernelSU 配置写入
       # ----------------------------------------------------------------------
       - name: 7.1 定位 kona defconfig
@@ -555,59 +716,142 @@ jobs:
               "arch/arm64/configs/vendor/oplus_defconfig"; do
               if [ -f "$cand" ]; then DEFCFG="$cand"; break; fi
             done
+            # 兜底 1: 任意含 rmx3370 的 defconfig (某些 OPLUS 树用机型名)
+            if [ -z "$DEFCFG" ]; then
+              DEFCFG=$(find arch/arm64/configs -type f -name '*rmx3370*' | head -n1 || true)
+            fi
+            # 兜底 2: 任意含 kona 的 perf defconfig
+            if [ -z "$DEFCFG" ]; then
+              DEFCFG=$(find arch/arm64/configs -type f -name '*kona*perf*' | head -n1 || true)
+            fi
+            # 兜底 3: 任意含 kona 的 defconfig
             if [ -z "$DEFCFG" ]; then
               DEFCFG=$(find arch/arm64/configs -type f -name '*kona*' | head -n1 || true)
             fi
           fi
 
           if [ -z "$DEFCFG" ] || [ ! -f "$DEFCFG" ]; then
-            echo "::error:: 未能定位 kona defconfig, 请用 defconfig_override 手动指定"
+            echo "::error:: 未能定位 defconfig。以下是 arch/arm64/configs 下全部文件:"
+            find arch/arm64/configs -type f | sort
+            echo "::error:: 请把 defconfig_override 设为上面列表中的相对路径 (例如 vendor/kona-perf_defconfig)"
             exit 1
           fi
           echo ">>> 锁定 DEFCONFIG: $DEFCFG"
           echo "DEFCFG=$DEFCFG" >> "$GITHUB_ENV"
           # 传给 make 的相对 path (相对 arch/arm64/configs)
-          echo "DEFCFG_REL=${DEFCFG#arch/arm64/configs/}" >> "$GITHUB_ENV"
+          DEFCFG_REL="${DEFCFG#arch/arm64/configs/}"
+          echo ">>> 传给 make 的目标: $DEFCFG_REL"
+          echo "DEFCFG_REL=$DEFCFG_REL" >> "$GITHUB_ENV"
 
       - name: 7.2 写入 KernelSU 配置项
         working-directory: ${{ github.workspace }}/oplus/kernel/msm-4.19
         run: |
           set -eux
           F="$DEFCFG"
-          grep -q 'CONFIG_KSU=y' "$F" || echo 'CONFIG_KSU=y' >> "$F"
-          grep -q 'CONFIG_OVERLAY_FS=y' "$F" || echo 'CONFIG_OVERLAY_FS=y' >> "$F"
-          grep -q 'CONFIG_KSU_MANUAL_HOOK' "$F" || echo 'CONFIG_KSU_MANUAL_HOOK=y' >> "$F"
+          test -f "$F" || { echo "::error:: defconfig 不存在: $F"; exit 1; }
+
+          add_kv() {
+            # $1=key  $2=value  幂等追加 (先删除同名行再追加)
+            sed -i -E "/^[[:space:]]*#?[[:space:]]*${1}[[:space:]]*[=)].*$/d" "$F" 2>/dev/null || true
+            echo "${1}=${2}" >> "$F"
+          }
+
+          add_kv CONFIG_KSU y
+          add_kv CONFIG_OVERLAY_FS y
+          add_kv CONFIG_KSU_MANUAL_HOOK y
 
           if [ "${{ inputs.hook_mode }}" = "kprobe" ]; then
-            {
-              echo 'CONFIG_KPROBES=y'
-              echo 'CONFIG_HAVE_KPROBES=y'
-              echo 'CONFIG_KPROBE_EVENTS=y'
-              echo 'CONFIG_KSU_KPROBE_HOOKS=y'
-            } >> "$F"
+            add_kv CONFIG_KPROBES y
+            add_kv CONFIG_HAVE_KPROBES y
+            add_kv CONFIG_KPROBE_EVENTS y
+            add_kv CONFIG_KSU_KPROBE_HOOKS y
           else
-            {
-              echo '# CONFIG_KPROBES is not set'
-              echo '# CONFIG_KSU_KPROBE_HOOKS is not set'
-            } >> "$F"
+            # manual 模式: 必须显式关闭 kprobe, 否则 4.19 kona 易卡开机
+            sed -i -E '/^CONFIG_KPROBES[[:space:]]*=/d' "$F" 2>/dev/null || true
+            sed -i -E '/^CONFIG_KSU_KPROBE_HOOKS[[:space:]]*=/d' "$F" 2>/dev/null || true
+            printf '# CONFIG_KPROBES is not set\n# CONFIG_KSU_KPROBE_HOOKS is not set\n' >> "$F"
           fi
+
           echo ">>> 追加后的 KernelSU 相关配置:"
           grep -n 'CONFIG_KSU\|CONFIG_OVERLAY_FS\|CONFIG_KPROBE' "$F" || true
 
       # ----------------------------------------------------------------------
       # 8. 编译内核
       # ----------------------------------------------------------------------
+      - name: 8.0 编译前环境净化与预检
+        working-directory: ${{ github.workspace }}/oplus/kernel/msm-4.19
+        run: |
+          set -ux
+
+          echo "================= defconfig 目标预检 ================="
+          echo "DEFCFG     = ${DEFCFG:-<未设置>}"
+          echo "DEFCFG_REL = ${DEFCFG_REL:-<未设置>}"
+          if [ -n "${DEFCFG:-}" ] && [ -f "$DEFCFG" ]; then
+            echo "defconfig 文件存在, 行数 = $(wc -l < "$DEFCFG")"
+          else
+            echo "::error:: defconfig 文件不存在: ${DEFCFG:-未设置}"
+            exit 1
+          fi
+
+          echo ""
+          echo "================= Kconfig source 完整性 ================="
+          MISSING=0
+          for topkc in Kconfig arch/arm64/Kconfig init/Kconfig kernel/Kconfig drivers/Kconfig fs/Kconfig mm/Kconfig net/Kconfig; do
+            [ -f "$topkc" ] || continue
+            bd=$(dirname "$topkc")
+            while read -r kc; do
+              [ -z "$kc" ] && continue
+              case "$kc" in ../*|/*) continue ;; esac
+              if [ ! -f "$bd/$kc" ]; then
+                echo "  [缺失] $topkc -> $kc"
+                MISSING=$((MISSING+1))
+                mkdir -p "$(dirname "$bd/$kc")"
+                printf '# 自动生成占位 Kconfig\n\n' > "$bd/$kc"
+              fi
+            done < <(grep -oE 'source[[:space:]]+"[^"]+"' "$topkc" 2>/dev/null | sed -E 's/^source[[:space:]]+"([^"]+)"$/\1/' || true)
+          done
+          echo "补齐缺失 Kconfig: $MISSING 个"
+
+          echo ""
+          echo "================= Python / 主机工具预检 ================="
+          echo "python3 : $(command -v python3 || echo '<无>')"
+          python3 --version 2>&1 || true
+          echo "python  : $(command -v python || echo '<无>')"
+          echo "python2 : $(command -v python2 || echo '<无, 已由 6.5 步规避>')"
+          # kbuild 有时调用 `python` (py2 习惯), 指向 python3 避免 "command not found"
+          if ! command -v python >/dev/null 2>&1; then
+            mkdir -p "$HOME/.local/bin"
+            ln -sf "$(command -v python3)" "$HOME/.local/bin/python" 2>/dev/null || true
+            export PATH="$HOME/.local/bin:$PATH"
+            echo ">>> 已创建 python -> python3 软链"
+          fi
+
+          echo ""
+          echo "================= 遗留 wrapper 状态 ================="
+          ls -la scripts/gcc-wrapper.py* scripts/ld-wrapper.py* 2>/dev/null || echo "  <无遗留 wrapper 或已改名>"
+          grep -rn 'gcc-wrapper' scripts/Makefile* Makefile 2>/dev/null | head -10 || true
+
+          echo ""
+          echo "================= 工具链可执行性 ================="
+          for t in "${CLANG_DIR}/bin/clang" "${GCC64_DIR}/bin/aarch64-unknown-linux-gnu-gcc" "${GCC32_DIR}/bin/arm-unknown-linux-gnueabi-gcc"; do
+            if [ -x "$t" ]; then echo "  [OK]   $t"; else echo "  [MISS] $t"; fi
+          done
+
+          echo ">>> 8.0 预检完成"
+
       - name: 8.1 生成 .config
         working-directory: ${{ github.workspace }}/oplus/kernel/msm-4.19
         run: |
           set -eux
-          export PATH="${CLANG_DIR}/bin:$PATH"
+          export PATH="${CLANG_DIR}/bin:${GCC64_DIR}/bin:${GCC32_DIR}/bin:$PATH"
           export ARCH=arm64
           export SUBARCH=arm64
           export CC=clang
           export CLANG_TRIPLE=aarch64-linux-gnu-
           export CROSS_COMPILE="${GCC64_DIR}/bin/aarch64-unknown-linux-gnu-"
           export CROSS_COMPILE_ARM32="${GCC32_DIR}/bin/arm-unknown-linux-gnueabi-"
+          export HOSTCC=clang
+          export HOSTCXX=clang++
 
           if [ "${{ inputs.use_ccache }}" = "true" ]; then
             ccache --max-size=5G || true
@@ -617,16 +861,30 @@ jobs:
 
           clang --version
 
-          # 4.19 + Clang 生成 defconfig 时统一使用 LLVM=1 语义
+          echo ">>> 即将执行: make O=out ARCH=arm64 ... $DEFCFG_REL"
+          set +e
           make O=out ARCH=arm64 \
             CC="$CC" \
+            HOSTCC="$HOSTCC" HOSTCXX="$HOSTCXX" \
             CLANG_TRIPLE="$CLANG_TRIPLE" \
             CROSS_COMPILE="$CROSS_COMPILE" \
             CROSS_COMPILE_ARM32="$CROSS_COMPILE_ARM32" \
             LD=ld.lld AR=llvm-ar NM=llvm-nm \
             OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump \
             STRIP=llvm-strip READELF=llvm-readelf \
-            "$DEFCFG_REL"
+            "$DEFCFG_REL" > defconfig.log 2>&1
+          RC=$?
+          set -e
+
+          echo "===== defconfig.log ====="
+          cat defconfig.log || true
+
+          if [ "$RC" -ne 0 ]; then
+            echo "::error:: defconfig 失败 (退出码 $RC), 目标=$DEFCFG_REL"
+            echo "===== 错误摘要 ====="
+            grep -nE 'error|Error|syntax|can.t open|No such file|not found|\*\*\*' defconfig.log | head -80 || true
+            exit "$RC"
+          fi
 
           test -f out/.config || { echo "::error:: out/.config 未生成"; exit 1; }
           echo ">>> 关键配置:"
