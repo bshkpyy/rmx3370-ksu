@@ -90,46 +90,113 @@ jobs:
       - name: 2.1 克隆 realme GT Neo2 Android T 内核源码
         run: |
           set -eux
-          mkdir -p "$GITHUB_WORKSPACE/oplus"
-          git clone --depth=1 --branch "${KERNEL_BRANCH:-master}" \
-            "${{ inputs.kernel_repo }}" \
-            "$GITHUB_WORKSPACE/oplus/kernel/msm-4.19" \
-            || git clone --depth=1 "${{ inputs.kernel_repo }}" \
-                 "$GITHUB_WORKSPACE/oplus/kernel/msm-4.19"
-          cd "$GITHUB_WORKSPACE/oplus/kernel/msm-4.19"
+          TARGET="$GITHUB_WORKSPACE/oplus/kernel/msm-4.19"
+          mkdir -p "$GITHUB_WORKSPACE/oplus/kernel"
+
+          # 幂等: 目录已存在且是有效 git 树则跳过
+          if [ -d "$TARGET/.git" ]; then
+            echo ">>> $TARGET 已存在有效仓库, 跳过克隆"
+          else
+            # 重试前必须清掉残留目录, 否则第二次 clone 会因目标非空而失败
+            rm -rf "$TARGET"
+            ok=0
+            for attempt in 1 2 3; do
+              echo ">>> 克隆尝试 $attempt/3"
+              if git clone --depth=1 --branch "${KERNEL_BRANCH:-master}" \
+                   "${{ inputs.kernel_repo }}" "$TARGET"; then
+                ok=1; break
+              fi
+              rm -rf "$TARGET"
+              # 第二、三次改为不带 --branch, 让它用默认分支
+              if [ "$attempt" -ge 2 ]; then
+                if git clone --depth=1 "${{ inputs.kernel_repo }}" "$TARGET"; then
+                  ok=1; break
+                fi
+                rm -rf "$TARGET"
+              fi
+              sleep 10
+            done
+            if [ "$ok" -ne 1 ]; then
+              echo "::error:: 内核源码克隆失败 (3 次尝试均未成功)"
+              exit 1
+            fi
+          fi
+
+          cd "$TARGET"
           git log -1 --oneline
-          grep -m1 -E '^VERSION|^PATCHLEVEL|^SUBLEVEL' Makefile || true
           echo "--- 内核版本 ---"
           head -5 Makefile
+          VERSION_LINE=$(grep -m1 -E '^(VERSION|PATCHLEVEL|SUBLEVEL)\s*=' Makefile || true)
+          echo "$VERSION_LINE" || true
+          echo "SRC_DIR=$TARGET" >> "$GITHUB_ENV"
 
       # ----------------------------------------------------------------------
-      # 3. 工具链: 使用 AOSP Clang + GCC 交叉编译器
-      #    注意 proton-clang 仓库只是包装, 直接 clone 得不到 bin/clang,
-      #    必须走它自己的 setup 或者直接下 AOSP prebuilt。
+      # 3. 工具链
+      #    重要: android.googlesource.com 的 +archive/<ref>/<path>.tar.gz 端点
+      #    对 clang-rXXXXXX 这类目录返回 400, 会让 aria2c 落盘一个非 gzip 文件,
+      #    随后 tar 报 "not in gzip format" 并以 exit 2 终止 job。
+      #    这里改用 GitHub Release 上真正带 bin/clang 的 pinned 预编译包。
+      #    Clang 14 是 4.19 / sm8250 的黄金版本 (15+ 会对 4.19 大量报错)。
       # ----------------------------------------------------------------------
-      - name: 3.1 下载 AOSP Clang (r487747c, 已验证兼容 4.19/sm8250)
+      - name: 3.1 下载 Clang 14.0.6 工具链 (pinned, 带预编译二进制)
+        env:
+          CLANG_URL: https://github.com/ZyCromerZ/Clang/releases/download/14.0.6-20261011-release/Clang-14.0.6-20261011.tar.gz
         run: |
           set -eux
           mkdir -p "$GITHUB_WORKSPACE/toolchains"
           cd "$GITHUB_WORKSPACE/toolchains"
-          aria2c -q -x16 -s16 -o clang.tar.gz \
-            "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/clang-r487747c.tar.gz" \
-            || curl -LSs -o clang.tar.gz \
-            "https://github.com/kdrag0n/proton-clang/releases/latest/download/proton-clang.tar.gz"
+
+          curl -LSs --retry 5 --retry-delay 5 --retry-all-errors \
+               --connect-timeout 30 --max-time 900 \
+               -o clang.tar.gz "$CLANG_URL"
+
+          # 体积与 gzip 魔数双重校验, 防止把错误页当压缩包
+          ls -lh clang.tar.gz
+          SIZE=$(stat -c%s clang.tar.gz)
+          if [ "$SIZE" -lt 100000000 ]; then
+            echo "::error:: Clang 压缩包体积异常 (${SIZE} bytes), 下载失败"
+            exit 1
+          fi
+          if ! gzip -t clang.tar.gz 2>/dev/null; then
+            echo "::error:: clang.tar.gz 不是合法 gzip 文件"
+            head -c 300 clang.tar.gz || true
+            exit 1
+          fi
+
           mkdir -p clang
           tar -xzf clang.tar.gz -C clang
           rm -f clang.tar.gz
-          ls clang/bin/ | head -20
-          ./clang/bin/clang --version
 
-      - name: 3.2 下载 AArch64 / ARM32 GCC 交叉编译器 (binutils + 32bit 支持)
+          # 不同打包方式的目录层级可能不同, 统一定位到含 bin/clang 的那一层
+          if [ ! -x clang/bin/clang ]; then
+            inner=$(find clang -maxdepth 3 -type f -name clang -path '*/bin/*' | head -n1 || true)
+            if [ -n "$inner" ]; then
+              inner_root=$(dirname "$(dirname "$inner")")
+              echo ">>> 提升工具链根目录: $inner_root"
+              mv clang clang_tmp
+              mv clang_tmp/*/* clang/ 2>/dev/null || mv "$inner_root" clang_full
+              if [ -d clang_full ]; then rm -rf clang; mv clang_full clang; fi
+              rm -rf clang_tmp
+            fi
+          fi
+
+          test -x clang/bin/clang || { echo "::error:: 未找到 clang/bin/clang"; find clang -maxdepth 3 -type d | head -30; exit 1; }
+          ./clang/bin/clang --version
+          echo "CLANG_DIR=$GITHUB_WORKSPACE/toolchains/clang" >> "$GITHUB_ENV"
+
+      - name: 3.2 下载 AArch64 / ARM32 GCC 交叉编译器
         run: |
           set -eux
           cd "$GITHUB_WORKSPACE/toolchains"
           git clone --depth=1 https://github.com/arter97/arm64-gcc.git gcc64
           git clone --depth=1 https://github.com/arter97/arm32-gcc.git gcc32
-          ls gcc64/bin/ | head
-          ls gcc32/bin/ | head
+          test -x gcc64/bin/aarch64-unknown-linux-gnu-gcc || { echo "::error:: gcc64 缺少 aarch64 交叉 gcc"; ls gcc64/bin | head -30; exit 1; }
+          test -x gcc32/bin/arm-unknown-linux-gnueabi-gcc || { echo "::error:: gcc32 缺少 arm32 交叉 gcc"; ls gcc32/bin | head -30; exit 1; }
+          echo ">>> 交叉编译器就绪"
+          gcc64/bin/aarch64-unknown-linux-gnu-gcc --version | head -1
+          gcc32/bin/arm-unknown-linux-gnueabi-gcc --version | head -1
+          echo "GCC64_DIR=$GITHUB_WORKSPACE/toolchains/gcc64" >> "$GITHUB_ENV"
+          echo "GCC32_DIR=$GITHUB_WORKSPACE/toolchains/gcc32" >> "$GITHUB_ENV"
 
       # ----------------------------------------------------------------------
       # 4. 修正 OPLUS 源码深层相对 include
@@ -140,10 +207,20 @@ jobs:
       - name: 4.1 归一化 OPLUS 深层相对 include
         working-directory: ${{ github.workspace }}/oplus/kernel/msm-4.19
         run: |
+          set -eu
+          if [ ! -f Makefile ] || [ ! -d fs ]; then
+            echo "::error:: 内核源码树不完整 (缺少 Makefile 或 fs/), 无法归一化"
+            pwd; ls -la
+            exit 1
+          fi
           python3 - <<'PYEOF'
           import os, re, sys
 
           root = os.getcwd()
+          if not os.path.isdir(os.path.join(root, 'fs')):
+              print('::error:: fs/ 目录不存在, 源码树异常')
+              sys.exit(1)
+
           # 匹配 #include "../../..(/..)*/kernel/msm-4.19/xxx.h" 以及
           #      #include "../../../kernel/xxx.h" 两种形态
           pat = re.compile(
@@ -152,12 +229,14 @@ jobs:
 
           fixed_files = 0
           fixed_hits = 0
+          scanned = 0
           for dirpath, dirnames, filenames in os.walk(root):
               # 跳过 .git / 构建产物
               dirnames[:] = [d for d in dirnames if d not in ('.git', 'out')]
               for fn in filenames:
                   if not fn.endswith(('.c', '.h', '.S', '.cpp', '.cc')):
                       continue
+                  scanned += 1
                   fpath = os.path.join(dirpath, fn)
                   try:
                       with open(fpath, 'r', encoding='utf-8', errors='ignore') as f:
@@ -174,7 +253,11 @@ jobs:
                       fixed_files += 1
                       fixed_hits += n
                       print('[FIX] %s  (%d 处)' % (os.path.relpath(fpath, root), n))
-          print('[OPLUS-Normalize] 文件 %d 个, include %d 处' % (fixed_files, fixed_hits))
+          print('[OPLUS-Normalize] 扫描 %d 个源文件, 修正 %d 个文件 / %d 处 include'
+                % (scanned, fixed_files, fixed_hits))
+          if scanned == 0:
+              print('::error:: 扫描到 0 个源文件, 源码树路径错误')
+              sys.exit(1)
           PYEOF
 
       # ----------------------------------------------------------------------
@@ -184,16 +267,47 @@ jobs:
         working-directory: ${{ github.workspace }}/oplus/kernel/msm-4.19
         run: |
           set -eux
+          rm -rf KernelSU
+
+          fetch_setup() {
+            # $1=首选URL $2=备用URL $3=输出文件
+            for u in "$1" "$2"; do
+              [ -z "$u" ] && continue
+              echo ">>> 尝试: $u"
+              if curl -LSs --retry 3 --retry-delay 3 --connect-timeout 20 --max-time 120 -o "$3" "$u"; then
+                if [ -s "$3" ] && head -c 64 "$3" | grep -q 'setup\|#!\|^[a-zA-Z]'; then
+                  return 0
+                fi
+              fi
+              sleep 3
+            done
+            return 1
+          }
+
           if [ "${{ inputs.ksu_variant }}" = "kernelsu-next" ]; then
-            echo ">>> KernelSU-Next (next 分支, 走 legacy 集成)"
-            curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" \
-              | bash -s legacy
+            echo ">>> KernelSU-Next (next 分支, legacy 集成)"
+            fetch_setup \
+              "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" \
+              "https://cdn.jsdelivr.net/gh/KernelSU-Next/KernelSU-Next@next/kernel/setup.sh" \
+              /tmp/ksu_setup.sh \
+              || { echo "::error:: KernelSU-Next setup.sh 下载失败"; exit 1; }
+            bash /tmp/ksu_setup.sh legacy
           else
             echo ">>> 原版 KernelSU v0.9.5 (最后支持非 GKI 的版本)"
-            curl -LSs "https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh" \
-              | bash -s v0.9.5
+            fetch_setup \
+              "https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh" \
+              "https://cdn.jsdelivr.net/gh/tiann/KernelSU@main/kernel/setup.sh" \
+              /tmp/ksu_setup.sh \
+              || { echo "::error:: KernelSU setup.sh 下载失败"; exit 1; }
+            bash /tmp/ksu_setup.sh v0.9.5
           fi
-          test -d KernelSU && echo "KernelSU 目录已就绪"
+
+          if [ ! -d KernelSU ]; then
+            echo "::error:: setup.sh 执行后未生成 KernelSU 目录"
+            ls -la
+            exit 1
+          fi
+          echo ">>> KernelSU 目录已就绪"
           ls KernelSU/ | head -20
 
       # ----------------------------------------------------------------------
@@ -444,48 +558,89 @@ jobs:
         working-directory: ${{ github.workspace }}/oplus/kernel/msm-4.19
         run: |
           set -eux
-          export PATH="$GITHUB_WORKSPACE/toolchains/clang/bin:$PATH"
+          export PATH="${CLANG_DIR}/bin:$PATH"
           export ARCH=arm64
           export SUBARCH=arm64
+          export CC=clang
+          export CLANG_TRIPLE=aarch64-linux-gnu-
+          export CROSS_COMPILE="${GCC64_DIR}/bin/aarch64-unknown-linux-gnu-"
+          export CROSS_COMPILE_ARM32="${GCC32_DIR}/bin/arm-unknown-linux-gnueabi-"
+
           if [ "${{ inputs.use_ccache }}" = "true" ]; then
+            ccache --max-size=5G || true
+            ccache -z || true
             export CC="ccache clang"
           fi
-          make O=out ARCH=arm64 "$DEFCFG_REL"
+
+          clang --version
+
+          # 4.19 + Clang 生成 defconfig 时统一使用 LLVM=1 语义
+          make O=out ARCH=arm64 \
+            CC="$CC" \
+            CLANG_TRIPLE="$CLANG_TRIPLE" \
+            CROSS_COMPILE="$CROSS_COMPILE" \
+            CROSS_COMPILE_ARM32="$CROSS_COMPILE_ARM32" \
+            LD=ld.lld AR=llvm-ar NM=llvm-nm \
+            OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump \
+            STRIP=llvm-strip READELF=llvm-readelf \
+            "$DEFCFG_REL"
+
+          test -f out/.config || { echo "::error:: out/.config 未生成"; exit 1; }
+          echo ">>> 关键配置:"
           grep -E 'CONFIG_KSU|CONFIG_KPROBE|CONFIG_OVERLAY_FS' out/.config || true
 
       - name: 8.2 编译 Image
         working-directory: ${{ github.workspace }}/oplus/kernel/msm-4.19
         run: |
           set -eux
-          export PATH="$GITHUB_WORKSPACE/toolchains/clang/bin:$PATH"
+          export PATH="${CLANG_DIR}/bin:$PATH"
           export ARCH=arm64
           export SUBARCH=arm64
           export KBUILD_BUILD_USER="KSU"
           export KBUILD_BUILD_HOST="RMX3370"
-          export TCBIN="$GITHUB_WORKSPACE/toolchains"
-          export CROSS_COMPILE="$TCBIN/gcc64/bin/aarch64-unknown-linux-gnu-"
-          export CROSS_COMPILE_ARM32="$TCBIN/gcc32/bin/arm-unknown-linux-gnueabi-"
-          export LD=ld.lld
-          export AR=llvm-ar
-          export NM=llvm-nm
-          export OBJCOPY=llvm-objcopy
-          export OBJDUMP=llvm-objdump
-          export STRIP=llvm-strip
-          export READELF=llvm-readelf
+          export KBUILD_BUILD_VERSION="1"
+          export CC=clang
+          export CLANG_TRIPLE=aarch64-linux-gnu-
+          export CROSS_COMPILE="${GCC64_DIR}/bin/aarch64-unknown-linux-gnu-"
+          export CROSS_COMPILE_ARM32="${GCC32_DIR}/bin/arm-unknown-linux-gnueabi-"
+          export LD=ld.lld AR=llvm-ar NM=llvm-nm
+          export OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump
+          export STRIP=llvm-strip READELF=llvm-readelf
 
+          if [ "${{ inputs.use_ccache }}" = "true" ]; then
+            export CC="ccache clang"
+          fi
+
+          # 关键: 不能把 make 的输出管进 tail —— 管道退出码取 tail, 会吞掉 make 失败。
+          # 改为落盘日志 + PIPESTATUS 判定。
+          set +e
           make -j"$(nproc --all)" O=out \
             ARCH=arm64 \
-            CC=clang \
-            CLANG_TRIPLE=aarch64-linux-gnu- \
+            CC="$CC" \
+            CLANG_TRIPLE="$CLANG_TRIPLE" \
             CROSS_COMPILE="$CROSS_COMPILE" \
             CROSS_COMPILE_ARM32="$CROSS_COMPILE_ARM32" \
             LD=ld.lld AR=llvm-ar NM=llvm-nm \
             OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump \
             STRIP=llvm-strip READELF=llvm-readelf \
-            KCFLAGS="-Wno-error" 2>&1 | tail -200
+            KCFLAGS="-Wno-error" > build.log 2>&1
+          MAKE_RC=$?
+          set -e
 
-          echo ">>> 编译产物:"
+          echo "===== build.log 末尾 120 行 ====="
+          tail -120 build.log || true
+
+          if [ "$MAKE_RC" -ne 0 ]; then
+            echo "::error:: make 失败, 退出码 $MAKE_RC"
+            echo "===== 错误摘要 ====="
+            grep -nE 'error:|Error [0-9]+|fatal error|\*\*\*' build.log | head -60 || true
+            exit "$MAKE_RC"
+          fi
+
+          echo "===== 编译产物 ====="
           ls -lh out/arch/arm64/boot/ || true
+          test -f out/arch/arm64/boot/Image || { echo "::error:: 未生成 out/arch/arm64/boot/Image"; ls -la out/arch/arm64/boot/ 2>/dev/null || true; exit 1; }
+          echo "::notice:: 内核 Image 编译成功"
 
       # ----------------------------------------------------------------------
       # 9. 打包
@@ -494,14 +649,26 @@ jobs:
         working-directory: ${{ github.workspace }}/oplus/kernel/msm-4.19
         run: |
           set -eux
-          if [ ! -f out/arch/arm64/boot/Image ]; then
-            echo "::error:: 未生成 out/arch/arm64/boot/Image, 编译失败"
+          SRC="$GITHUB_WORKSPACE/oplus/kernel/msm-4.19"
+          BOOT="$SRC/out/arch/arm64/boot"
+
+          if [ ! -f "$BOOT/Image" ]; then
+            echo "::error:: 未生成 $BOOT/Image, 编译失败"
+            ls -la "$BOOT" 2>/dev/null || true
             exit 1
           fi
 
-          git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git "$GITHUB_WORKSPACE/AnyKernel3"
-          rm -rf "$GITHUB_WORKSPACE/AnyKernel3/.git"
-          cd "$GITHUB_WORKSPACE/AnyKernel3"
+          AK3="$GITHUB_WORKSPACE/AnyKernel3"
+          rm -rf "$AK3"
+          ok=0
+          for attempt in 1 2 3; do
+            echo ">>> AnyKernel3 克隆尝试 $attempt/3"
+            if git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git "$AK3"; then ok=1; break; fi
+            rm -rf "$AK3"; sleep 8
+          done
+          [ "$ok" -eq 1 ] || { echo "::error:: AnyKernel3 克隆失败"; exit 1; }
+          rm -rf "$AK3/.git"
+          cd "$AK3"
 
           cat > anykernel.sh <<'EOF'
           properties() { '
@@ -525,21 +692,28 @@ jobs:
           write_boot;
           EOF
 
-          cp "$GITHUB_WORKSPACE/oplus/kernel/msm-4.19/out/arch/arm64/boot/Image" ./
+          cp "$BOOT/Image" ./
           for extra in dtbo.img dtb.img; do
-            if [ -f "$GITHUB_WORKSPACE/oplus/kernel/msm-4.19/out/arch/arm64/boot/$extra" ]; then
-              cp "$GITHUB_WORKSPACE/oplus/kernel/msm-4.19/out/arch/arm64/boot/$extra" ./
-            fi
+            [ -f "$BOOT/$extra" ] && cp "$BOOT/$extra" ./ || true
           done
+          ls -lh ./
 
-          mkdir -p "$GITHUB_WORKSPACE/release_out"
-          cp Image "$GITHUB_WORKSPACE/release_out/Image"
-          cp "$GITHUB_WORKSPACE/oplus/kernel/msm-4.19/out/arch/arm64/boot/Image" \
-             "$GITHUB_WORKSPACE/release_out/Image-raw" 2>/dev/null || true
+          REL="$GITHUB_WORKSPACE/release_out"
+          mkdir -p "$REL"
+          cp "$BOOT/Image" "$REL/Image"
 
           PKG="AnyKernel3-RMX3370-RealmeUI4-KSU-${{ inputs.ksu_variant }}-${{ inputs.hook_mode }}.zip"
-          zip -r9 "$GITHUB_WORKSPACE/release_out/$PKG" . -x '.git/*' 'README.md' '*placeholder'
-          ls -lh "$GITHUB_WORKSPACE/release_out/"
+          rm -f "$REL/$PKG"
+          zip -r9 "$REL/$PKG" . -x '.git/*' 'README.md' '*placeholder'
+
+          # 校验产物真实存在且非空
+          test -s "$REL/Image" || { echo "::error:: Image 为空"; exit 1; }
+          test -s "$REL/$PKG" || { echo "::error:: zip 为空"; exit 1; }
+
+          echo "===== 最终产物 ====="
+          ls -lh "$REL/"
+          echo "sha256:"
+          sha256sum "$REL"/* || true
 
       - name: 9.2 上传产物
         uses: actions/upload-artifact@v4
