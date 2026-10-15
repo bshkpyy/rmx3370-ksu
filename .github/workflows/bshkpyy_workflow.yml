@@ -51,6 +51,49 @@ jobs:
 
     steps:
       # ----------------------------------------------------------------------
+      # 0. 前置: 在任何步骤之前先建诊断目录并落盘环境信息
+      #    这样即使第一步就失败, always() 的归档步骤也有东西可传
+      # ----------------------------------------------------------------------
+      - name: 0.1 初始化诊断目录与环境快照
+        run: |
+          set +e
+          DIAG="$GITHUB_WORKSPACE/diagnostics"
+          mkdir -p "$DIAG"
+          {
+            echo "================= 环境快照 (job 起始) ================="
+            echo "run_id          : ${GITHUB_RUN_ID}"
+            echo "run_number      : ${GITHUB_RUN_NUMBER}"
+            echo "run_attempt     : ${GITHUB_RUN_ATTEMPT}"
+            echo "repository      : ${GITHUB_REPOSITORY}"
+            echo "ref             : ${GITHUB_REF}"
+            echo "sha             : ${GITHUB_SHA}"
+            echo "actor           : ${GITHUB_ACTOR}"
+            echo "event           : ${GITHUB_EVENT_NAME}"
+            echo "runner_os       : ${RUNNER_OS}"
+            echo "runner_arch     : ${RUNNER_ARCH}"
+            echo "runner_name     : ${RUNNER_NAME}"
+            echo "runner_image    : ${ImageOS:-unknown}"
+            echo "workspace       : ${GITHUB_WORKSPACE}"
+            echo "started_utc     : $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+            echo
+            echo "================= 输入参数 ================="
+            echo "ksu_variant       : ${{ inputs.ksu_variant }}"
+            echo "hook_mode         : ${{ inputs.hook_mode }}"
+            echo "kernel_repo       : ${{ inputs.kernel_repo }}"
+            echo "defconfig_override: '${{ inputs.defconfig_override }}'"
+            echo "use_ccache        : ${{ inputs.use_ccache }}"
+            echo
+            echo "================= 磁盘 ================="
+            df -h /
+            echo
+            echo "================= CPU / 内存 ================="
+            nproc --all
+            free -h
+          } > "$DIAG/summary.txt" 2>&1
+          cat "$DIAG/summary.txt"
+
+
+      # ----------------------------------------------------------------------
       # 1. 环境准备
       # ----------------------------------------------------------------------
       - name: 1.1 释放磁盘空间 (内核编译需要 30G+)
@@ -715,7 +758,125 @@ jobs:
           echo "sha256:"
           sha256sum "$REL"/* || true
 
+      # ----------------------------------------------------------------------
+      # 9.5 诊断归档 —— always() 保证成功或失败都会执行
+      #     把编译日志、配置、版本、工具链信息打包成 artifact, 免去翻网页日志
+      # ----------------------------------------------------------------------
+      - name: 9.5 归档诊断信息 (成功失败都执行)
+        if: always()
+        run: |
+          set +e
+          DIAG="$GITHUB_WORKSPACE/diagnostics"
+          mkdir -p "$DIAG"
+          SRC="$GITHUB_WORKSPACE/oplus/kernel/msm-4.19"
+
+          {
+            echo
+            echo "================= 构建环境 ================="
+            echo "run_id      : ${GITHUB_RUN_ID}"
+            echo "run_number  : ${GITHUB_RUN_NUMBER}"
+            echo "job         : ${GITHUB_JOB}"
+            echo "runner      : ${RUNNER_OS} ${RUNNER_ARCH}"
+            echo "workspace   : ${GITHUB_WORKSPACE}"
+            echo "结束时间    : $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+            echo "job_status  : ${{ job.status }}"
+            echo
+            echo "================= 工具链 ================="
+            echo "CLANG_DIR : ${CLANG_DIR:-<未设置>}"
+            echo "GCC64_DIR : ${GCC64_DIR:-<未设置>}"
+            echo "GCC32_DIR : ${GCC32_DIR:-<未设置>}"
+            echo "SRC_DIR   : ${SRC_DIR:-<未设置>}"
+            if [ -n "${CLANG_DIR:-}" ] && [ -x "${CLANG_DIR}/bin/clang" ]; then
+              "${CLANG_DIR}/bin/clang" --version
+            fi
+            if [ -n "${GCC64_DIR:-}" ] && [ -x "${GCC64_DIR}/bin/aarch64-unknown-linux-gnu-gcc" ]; then
+              "${GCC64_DIR}/bin/aarch64-unknown-linux-gnu-gcc" --version | head -1
+            fi
+            echo
+            echo "================= 内核源码 ================="
+            if [ -d "$SRC/.git" ]; then
+              git -C "$SRC" log -1 --oneline
+              git -C "$SRC" rev-parse HEAD
+            fi
+            echo "内核版本号:"
+            head -5 "$SRC/Makefile" 2>/dev/null
+            echo
+            echo "================= KernelSU 集成 ================="
+            if [ -d "$SRC/KernelSU" ]; then
+              echo ">>> KernelSU 顶层内容:"
+              ls -la "$SRC/KernelSU/" 2>&1 | head -30
+              echo ">>> KernelSU/kernel 文件:"
+              find "$SRC/KernelSU" -maxdepth 2 -type f 2>/dev/null | head -40
+              if [ -f "$SRC/KernelSU/kernel/Makefile" ]; then
+                echo ">>> KernelSU/kernel/Makefile:"
+                cat "$SRC/KernelSU/kernel/Makefile"
+              fi
+              # 版本信息
+              for vf in "$SRC/KernelSU/kernel/version.h" "$SRC/KernelSU/kernel/Kconfig"; do
+                [ -f "$vf" ] && { echo ">>> $vf:"; cat "$vf"; }
+              done
+            else
+              echo "<KernelSU 目录不存在>"
+            fi
+            echo
+            echo "================= Hook 注入校验 ================="
+            _hook_found=0
+            for f in fs/exec.c fs/open.c fs/read_write.c fs/stat.c kernel/reboot.c; do
+              echo "--- $f ---"
+              if [ -f "$SRC/$f" ]; then
+                if grep -n 'CONFIG_KSU\|ksu_handle' "$SRC/$f" 2>/dev/null; then
+                  _hook_found=$((_hook_found+1))
+                else
+                  echo "  <无 KernelSU 痕迹>"
+                fi
+              else
+                echo "  <文件不存在>"
+              fi
+            done
+            echo "已注入 hook 的文件数: ${_hook_found}/5 (manual 模式下预期 5)"
+            echo
+            echo "================= defconfig ================="
+            echo "DEFCFG     : ${DEFCFG:-<未设置>}"
+            echo "DEFCFG_REL : ${DEFCFG_REL:-<未设置>}"
+            if [ -n "${DEFCFG:-}" ] && [ -f "$SRC/$DEFCFG" ]; then
+              grep -n 'CONFIG_KSU\|CONFIG_KPROBE\|CONFIG_OVERLAY_FS' "$SRC/$DEFCFG" || true
+            else
+              echo "<defconfig 文件未找到: $SRC/${DEFCFG:-未设置}>"
+            fi
+            echo
+            echo "================= out/.config 关键项 ================="
+            if [ -f "$SRC/out/.config" ]; then
+              grep -E 'CONFIG_KSU|CONFIG_KPROBE|CONFIG_OVERLAY_FS' "$SRC/out/.config" || true
+            else
+              echo "<out/.config 不存在>"
+            fi
+          } >> "$DIAG/summary.txt" 2>&1
+
+          # 编译日志 (完整, 不截断)
+          [ -f "$SRC/build.log" ] && cp "$SRC/build.log" "$DIAG/build.log" || echo "<无 build.log>" > "$DIAG/build.log"
+          # 错误摘要
+          [ -f "$SRC/build.log" ] && grep -nE 'error:|Error [0-9]+|fatal error|\*\*\*|undefined reference|No rule to make' "$SRC/build.log" | head -200 > "$DIAG/errors.txt" 2>&1 || true
+          # 内核配置
+          [ -f "$SRC/out/.config" ] && cp "$SRC/out/.config" "$DIAG/dotconfig.txt" || true
+          # 产物清单
+          ls -laR "$GITHUB_WORKSPACE/release_out" > "$DIAG/artifacts.txt" 2>&1 || true
+          # 源码树结构
+          find "$SRC" -maxdepth 2 -type d > "$DIAG/srctree.txt" 2>&1 || true
+
+          echo "===== 诊断包内容 ====="
+          ls -lh "$DIAG/"
+
+      - name: 9.6 上传诊断包 (成功失败都执行)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: DIAGNOSTICS-${{ github.run_number }}-${{ inputs.ksu_variant }}-${{ inputs.hook_mode }}
+          path: ${{ github.workspace }}/diagnostics/*
+          retention-days: 14
+          if-no-files-found: warn
+
       - name: 9.2 上传产物
+        if: success()
         uses: actions/upload-artifact@v4
         with:
           name: RMX3370-RealmeUI4-KernelSU-${{ inputs.ksu_variant }}-${{ inputs.hook_mode }}
