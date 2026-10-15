@@ -1,0 +1,326 @@
+name: Build KernelSU for RMX3370_13.1.0.601 (F.21 - Linux 4.19.157-perf+)
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+    inputs:
+      ksu_variant:
+        description: '选择 KernelSU 分支版本 (推荐 kernelsu-next)'
+        required: true
+        default: 'kernelsu-next'
+        type: choice
+        options:
+          - 'kernelsu-next'
+          - 'official-v0.9.5'
+      hook_mode:
+        description: '选择 Hook 模式 (F.21 原厂已开启 CONFIG_KPROBES=y，manual 与 kprobe 均支持)'
+        required: true
+        default: 'manual'
+        type: choice
+        options:
+          - 'manual'
+          - 'kprobe'
+
+jobs:
+  build-kernel:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+
+    steps:
+      - name: 0. 检出当前仓库文件 (读取上传的 RMX3370_F21_config.gz)
+        uses: actions/checkout@v4
+
+      - name: 1. 清理磁盘空间并安装编译依赖
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bc bison build-essential ccache curl flex g++-multilib gcc-multilib \
+            git gnupg gperf imagemagick lib32ncurses5-dev lib32readline-dev \
+            lib32z1-dev libelf-dev liblz4-tool libncurses5 libncurses5-dev \
+            libsdl1.2-dev libssl-dev libxml2 libxml2-utils lzop pngcrush \
+            python-is-python3 python3 rsync schedtool squashfs-tools xsltproc \
+            zip zlib1g-dev dwarves pahole device-tree-compiler cpio gzip
+
+      - name: 2. 拉取 Realme GT Neo2 (RMX3370 / RE5473) Android 13 官方内核源码
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/oplus_src/kernel"
+          git clone --depth=1 \
+            https://github.com/realme-kernel-opensource/realme_GTneo2-Q5pro-GTMasterExploratory-AndroidT-kernel-source.git \
+            "$GITHUB_WORKSPACE/oplus_src/kernel/msm-4.19"
+
+      - name: 3. 准备 Clang + GCC 4.9 (binutils 2.27) 交叉编译工具链
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/toolchains"
+          git clone --depth=1 https://github.com/kdrag0n/proton-clang.git "$GITHUB_WORKSPACE/toolchains/clang"
+
+      - name: 4. 修正 OPLUS 相对路径 + 注入 34 个外部 .ko 模块 (wlan/audio/rmnet) 兼容补丁
+        working-directory: ${{ github.workspace }}/oplus_src/kernel/msm-4.19
+        run: |
+          python3 - << 'EOF'
+          import os, re
+
+          root = os.getcwd()
+          # 1. 修复欧加驱动中写死的 ../../../../kernel/ 相对路径引用
+          pattern = re.compile(r'#include\s+["<](?:\.\./)+kernel/(?:msm-4\.19/)?([^">]+)[">]')
+          fixed_count = 0
+          for dirpath, _, filenames in os.walk(root):
+              if '.git' in dirpath:
+                  continue
+              for fn in filenames:
+                  if fn.endswith(('.c', '.h', '.S')):
+                      fpath = os.path.join(dirpath, fn)
+                      try:
+                          with open(fpath, 'r', encoding='utf-8', errors='ignore') as f:
+                              content = f.read()
+                          if '../../../../kernel' in content or '../../../kernel' in content:
+                              new_content, n = pattern.subn(r'#include <\1>', content)
+                              if n > 0:
+                                  with open(fpath, 'w', encoding='utf-8') as f:
+                                      f.write(new_content)
+                                  fixed_count += n
+                      except Exception:
+                          pass
+          print(f"[OPLUS Fix] 已自动修正 {fixed_count} 处深层相对路径头文件引用。")
+
+          # 2. 修改 kernel/module.c，绕过外部 vendor .ko 模块 (wlan.ko / *_dlkm.ko / rmnet_*.ko) 的 CRC 与 vermagic 严格校验
+          mod_path = os.path.join(root, "kernel/module.c")
+          if os.path.exists(mod_path):
+              with open(mod_path, "r", encoding="utf-8", errors="ignore") as f:
+                  mod_code = f.read()
+              # 让 check_version 始终返回 1，防止 /vendor/lib/modules/wlan.ko 因符号 CRC 差异加载失败导致断 Wi-Fi
+              mod_code_new, n1 = re.subn(
+                  r"(static int check_version\([^\)]+\)\s*\{)",
+                  r"\1\n\treturn 1; /* Bypass MODVERSIONS CRC for stock F.21 vendor DLKM modules */",
+                  mod_code,
+                  count=1
+              )
+              if n1 > 0:
+                  with open(mod_path, "w", encoding="utf-8") as f:
+                      f.write(mod_code_new)
+                  print("[Module Fix] 已为 kernel/module.c 注入 stock .ko 模块 CRC 兼容补丁（保障 Wi-Fi/音频/数据网络正常加载）。")
+          EOF
+
+      - name: 5. 集成 KernelSU 源码并注入 Hook 补丁
+        working-directory: ${{ github.workspace }}/oplus_src/kernel/msm-4.19
+        run: |
+          KSU_VAR="${{ inputs.ksu_variant || 'kernelsu-next' }}"
+          HOOK_MODE="${{ inputs.hook_mode || 'manual' }}"
+
+          if [ "$KSU_VAR" = "kernelsu-next" ]; then
+            echo ">>> 正在集成 KernelSU-Next (legacy 分支)..."
+            curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -s legacy
+          else
+            echo ">>> 正在集成原版 KernelSU (v0.9.5)..."
+            curl -LSs "https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh" | bash -s v0.9.5
+          fi
+
+          if [ "$HOOK_MODE" = "manual" ]; then
+            echo ">>> 正在对 5 个系统调用源文件注入非 GKI 手动 Hook 补丁..."
+            python3 - << 'EOF'
+          import os, re, sys
+
+          def patch_file(filepath, check_str, target_regex, replacement):
+              if not os.path.exists(filepath):
+                  print(f"[WARN] 文件不存在: {filepath}")
+                  return
+              with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
+                  content = f.read()
+              if check_str in content:
+                  print(f"[SKIP] {filepath} 已包含 {check_str}，跳过。")
+                  return
+              new_content, count = re.subn(target_regex, replacement, content, count=1, flags=re.MULTILINE | re.DOTALL)
+              if count == 0:
+                  print(f"[ERROR] 未能在 {filepath} 中匹配到目标函数结构！")
+                  sys.exit(1)
+              with open(filepath, 'w', encoding='utf-8') as f:
+                  f.write(new_content)
+              print(f"[OK] 成功为 {filepath} 注入 KernelSU Hook。")
+
+          exec_decl = (
+              "#ifdef CONFIG_KSU\n"
+              "extern bool ksu_execveat_hook __read_mostly;\n"
+              "extern int ksu_handle_execveat(int *fd, struct filename **filename_ptr, void *argv, void *envp, int *flags);\n"
+              "extern int ksu_handle_execveat_sucompat(int *fd, struct filename **filename_ptr, void *argv, void *envp, int *flags);\n"
+              "#endif\n\n"
+          )
+          patch_file(
+              "fs/exec.c",
+              "ksu_handle_execveat",
+              r"(static int do_execveat_common\(int fd,\s*struct filename \*filename,.*?\{)",
+              exec_decl + r"\1" + "\n#ifdef CONFIG_KSU\n\tif (unlikely(ksu_execveat_hook))\n\t\tksu_handle_execveat(&fd, &filename, &argv, &envp, &flags);\n\telse\n\t\tksu_handle_execveat_sucompat(&fd, &filename, &argv, &envp, &flags);\n#endif"
+          )
+
+          open_decl = (
+              "#ifdef CONFIG_KSU\n"
+              "extern int ksu_handle_faccessat(int *dfd, const char __user **filename_user, int *mode, int *flags);\n"
+              "#endif\n\n"
+          )
+          patch_file(
+              "fs/open.c",
+              "ksu_handle_faccessat",
+              r"(SYSCALL_DEFINE3\(faccessat,\s*int,\s*dfd,\s*const char __user \*,?\s*filename,\s*int,\s*mode\)\s*\{)",
+              open_decl + r"\1" + "\n#ifdef CONFIG_KSU\n\tksu_handle_faccessat(&dfd, &filename, &mode, NULL);\n#endif"
+          )
+
+          rw_decl = (
+              "#ifdef CONFIG_KSU\n"
+              "extern bool ksu_vfs_read_hook __read_mostly;\n"
+              "extern int ksu_handle_vfs_read(struct file **file_ptr, char __user **buf_ptr, size_t *count_ptr, loff_t **pos);\n"
+              "#endif\n\n"
+          )
+          patch_file(
+              "fs/read_write.c",
+              "ksu_handle_vfs_read",
+              r"(ssize_t vfs_read\(struct file \*file,\s*char __user \*buf,\s*size_t count,\s*loff_t \*pos\)\s*\{)",
+              rw_decl + r"\1" + "\n#ifdef CONFIG_KSU\n\tif (unlikely(ksu_vfs_read_hook))\n\t\tksu_handle_vfs_read(&file, &buf, &count, &pos);\n#endif"
+          )
+
+          stat_decl = (
+              "#ifdef CONFIG_KSU\n"
+              "extern int ksu_handle_stat(int *dfd, const char __user **filename_user, int *flags);\n"
+              "#endif\n\n"
+          )
+          patch_file(
+              "fs/stat.c",
+              "ksu_handle_stat",
+              r"(int vfs_statx\(int dfd,\s*const char __user \*filename,\s*int flags,\s*struct kstat \*stat,\s*u32 request_mask\)\s*\{)",
+              stat_decl + r"\1" + "\n#ifdef CONFIG_KSU\n\tksu_handle_stat(&dfd, &filename, &flags);\n#endif"
+          )
+
+          reboot_decl = (
+              "#ifdef CONFIG_KSU\n"
+              "extern int ksu_handle_sys_reboot(int magic1, int magic2, unsigned int cmd, void __user **arg);\n"
+              "#endif\n\n"
+          )
+          patch_file(
+              "kernel/reboot.c",
+              "ksu_handle_sys_reboot",
+              r"(SYSCALL_DEFINE4\(reboot,\s*int,\s*magic1,\s*int,\s*magic2,\s*unsigned int,\s*cmd,\s*void __user \*,?\s*arg\)\s*\{)",
+              reboot_decl + r"\1" + "\n#ifdef CONFIG_KSU\n\tksu_handle_sys_reboot(magic1, magic2, cmd, &arg);\n#endif"
+          )
+          EOF
+          fi
+
+      - name: 6. 应用真机提取的 RMX3370_F21_config.gz (或 kona-perf_defconfig) 并锁定 4.19.157-perf+
+        working-directory: ${{ github.workspace }}/oplus_src/kernel/msm-4.19
+        run: |
+          HOOK_MODE="${{ inputs.hook_mode || 'manual' }}"
+          mkdir -p out
+
+          if [ -f "$GITHUB_WORKSPACE/RMX3370_F21_config.gz" ]; then
+            echo ">>> 检测到你从真机提取的 RMX3370_F21_config.gz，直接解压作为基准 .config！"
+            zcat "$GITHUB_WORKSPACE/RMX3370_F21_config.gz" > arch/arm64/configs/rmx3370_f21_defconfig
+            TARGET_DEFCONFIG="rmx3370_f21_defconfig"
+          elif [ -f "arch/arm64/configs/vendor/kona-perf_defconfig" ]; then
+            TARGET_DEFCONFIG="vendor/kona-perf_defconfig"
+          elif [ -f "arch/arm64/configs/kona-perf_defconfig" ]; then
+            TARGET_DEFCONFIG="kona-perf_defconfig"
+          else
+            TARGET_DEFCONFIG=$(cd arch/arm64/configs && find . -name "*kona*perf*" -o -name "*kona*" | head -n 1 | sed 's|^\./||')
+          fi
+
+          CONFIG_FILE="arch/arm64/configs/$TARGET_DEFCONFIG"
+          echo ">>> 使用的配置文件: $CONFIG_FILE"
+
+          cat >> "$CONFIG_FILE" << 'EOF'
+
+          # === RMX3370_11.F.21 (4.19.157-perf+) & KernelSU 专属配置 ===
+          CONFIG_LOCALVERSION="-perf"
+          # CONFIG_LOCALVERSION_AUTO is not set
+          CONFIG_BUILD_ARM64_UNCOMPRESSED_KERNEL=y
+          CONFIG_KSU=y
+          CONFIG_OVERLAY_FS=y
+          CONFIG_MODULES=y
+          CONFIG_MODVERSIONS=y
+          # CONFIG_MODULE_SIG_FORCE is not set
+          EOF
+
+          if [ "$HOOK_MODE" = "kprobe" ]; then
+            cat >> "$CONFIG_FILE" << 'EOF'
+          CONFIG_KPROBES=y
+          CONFIG_HAVE_KPROBES=y
+          CONFIG_KPROBE_EVENTS=y
+          CONFIG_KSU_KPROBE_HOOKS=y
+          EOF
+          else
+            cat >> "$CONFIG_FILE" << 'EOF'
+          # CONFIG_KSU_KPROBE_HOOKS is not set
+          EOF
+          fi
+
+          echo "TARGET_DEFCONFIG=$TARGET_DEFCONFIG" >> "$GITHUB_ENV"
+
+      - name: 7. 编译内核 (锁定 vermagic 为 4.19.157-perf+)
+        working-directory: ${{ github.workspace }}/oplus_src/kernel/msm-4.19
+        run: |
+          export PATH="$GITHUB_WORKSPACE/toolchains/clang/bin:$PATH"
+          export ARCH=arm64
+          export SUBARCH=arm64
+          export KBUILD_BUILD_USER="root"
+          export KBUILD_BUILD_HOST="dg02-pool06-kvm50"
+
+          make O=out ARCH=arm64 "$TARGET_DEFCONFIG"
+
+          # 确保生成的内核版本号严格为 4.19.157-perf+，与 /vendor/lib/modules/*.ko 的 vermagic 完全一致
+          make -j$(nproc --all) O=out \
+            ARCH=arm64 \
+            CC=clang \
+            LOCALVERSION="-perf+" \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
+            AR=llvm-ar \
+            NM=llvm-nm \
+            OBJCOPY=llvm-objcopy \
+            OBJDUMP=llvm-objdump \
+            STRIP=llvm-strip \
+            KCFLAGS="-Wno-error"
+
+          ls -lh out/arch/arm64/boot/Image
+
+      - name: 8. 打包 AnyKernel3 刷机包 (适配非 A/B 分区 sde11) 与独立 Image
+        working-directory: ${{ github.workspace }}/oplus_src/kernel/msm-4.19
+        run: |
+          git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git AnyKernel3
+          rm -rf AnyKernel3/.git
+
+          cat > AnyKernel3/anykernel.sh << 'EOF'
+          # AnyKernel3 Ramdisk Mod Script for RMX3370 / RE5473 (Realme UI 4.0 F.21)
+          properties() { '
+          kernel.string=KernelSU Built-in for RMX3370_13.1.0.601 (F.21 4.19.157-perf+)
+          do.devicecheck=1
+          do.modules=0
+          do.systemless=1
+          do.cleanup=1
+          do.cleanuponabort=0
+          device.name1=RMX3370
+          device.name2=RE5473
+          device.name3=bitra
+          device.name4=kona
+          supported.versions=13
+          '; }
+
+          # 对应真机 /dev/block/by-name/boot -> /dev/block/sde11 (Non-A/B 单槽位)
+          block=/dev/block/by-name/boot;
+          is_slot_device=0;
+          ramdisk_compression=auto;
+          patch_vbmeta_flag=auto;
+
+          . tools/ak3-core.sh;
+
+          dump_boot;
+          write_boot;
+          EOF
+
+          cp out/arch/arm64/boot/Image AnyKernel3/
+          mkdir -p "$GITHUB_WORKSPACE/release_out"
+          cp out/arch/arm64/boot/Image "$GITHUB_WORKSPACE/release_out/Image"
+          cd AnyKernel3
+          zip -r9 "$GITHUB_WORKSPACE/release_out/AnyKernel3-RMX3370-F21-KernelSU.zip" * -x .git README.md *placeholder
+
+      - name: 9. 上传编译产物 (AnyKernel3 刷机包 + 独立未压缩内核 Image)
+        uses: actions/upload-artifact@v4
+        with:
+          name: RMX3370-F21-KernelSU-Package
+          path: ${{ github.workspace }}/release_out/*
