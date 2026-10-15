@@ -1,0 +1,549 @@
+name: Build KernelSU for Realme GT Neo2 (RMX3370 / RE5473 / kona / Android 13)
+
+# ============================================================================
+# 目标设备: realme GT Neo2 (RMX3370 / 国内工程代号 RE5473 / 社区代号 bitra)
+# 平台    : Qualcomm kona (SM8250, 骁龙 870)
+# 内核    : Linux 4.19.157 (OPLUS Android T 分支, 非 GKI 2.0)
+# 方案    : KernelSU 内置模式 (CONFIG_KSU=y) + 手动 syscall hook 补丁
+#          (4.19 非 GKI 不支持 LKM, 必须 built-in)
+# 产出    : AnyKernel3-RMX3370-RealmeUI4-KSU.zip  与  独立 Image
+# ============================================================================
+
+on:
+  workflow_dispatch:
+    inputs:
+      ksu_variant:
+        description: 'KernelSU 分支 (4.19 非 GKI 只能用 kernelsu-next legacy 或 official v0.9.5)'
+        required: true
+        default: 'kernelsu-next'
+        type: choice
+        options:
+          - 'kernelsu-next'
+          - 'official-v0.9.5'
+      hook_mode:
+        description: 'Hook 模式 (kona 4.19 强烈建议 manual, 开 kprobe 常见卡开机)'
+        required: true
+        default: 'manual'
+        type: choice
+        options:
+          - 'manual'
+          - 'kprobe'
+      kernel_repo:
+        description: 'OPLUS 内核源码仓库 (默认官方 realme-kernel-opensource)'
+        required: false
+        default: 'https://github.com/realme-kernel-opensource/realme_GTneo2-Q5pro-GTMasterExploratory-AndroidT-kernel-source.git'
+        type: string
+      defconfig_override:
+        description: '手动指定 defconfig 相对路径 (留空=自动探测)'
+        required: false
+        default: ''
+        type: string
+      use_ccache:
+        description: '启用 ccache 加速'
+        required: true
+        default: true
+        type: boolean
+
+jobs:
+  build-kernel:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 180
+
+    steps:
+      # ----------------------------------------------------------------------
+      # 1. 环境准备
+      # ----------------------------------------------------------------------
+      - name: 1.1 释放磁盘空间 (内核编译需要 30G+)
+        run: |
+          set -eux
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL /usr/local/share/boost \
+                      "$AGENT_TOOLSDIRECTORY" || true
+          sudo apt-get clean
+          df -h /
+
+      - name: 1.2 安装编译依赖
+        run: |
+          set -eux
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            bc bison build-essential ccache curl flex g++-multilib gcc-multilib \
+            git gnupg gperf imagemagick lib32ncurses5-dev lib32readline-dev \
+            lib32z1-dev libelf-dev liblz4-tool libncurses5 libncurses5-dev \
+            libsdl1.2-dev libssl-dev libxml2 libxml2-utils lzop pngcrush \
+            python-is-python3 python3 rsync schedtool squashfs-tools xsltproc \
+            zip zlib1g-dev dwarves pahole device-tree-compiler cpio unzip \
+            libfdt-dev libgmp-dev libmpc-dev aria2
+
+      - name: 1.3 配置 ccache
+        if: ${{ inputs.use_ccache }}
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: rmx3370-kona-4.19-${{ inputs.ksu_variant }}
+
+      # ----------------------------------------------------------------------
+      # 2. 拉取 OPLUS Android T 内核源码
+      #    OPLUS 源码树内的相对 include 依赖 "kernel/msm-4.19" 层级,
+      #    因此必须把 msm-4.19 放在 <workspace>/kernel/msm-4.19
+      # ----------------------------------------------------------------------
+      - name: 2.1 克隆 realme GT Neo2 Android T 内核源码
+        run: |
+          set -eux
+          mkdir -p "$GITHUB_WORKSPACE/oplus"
+          git clone --depth=1 --branch "${KERNEL_BRANCH:-master}" \
+            "${{ inputs.kernel_repo }}" \
+            "$GITHUB_WORKSPACE/oplus/kernel/msm-4.19" \
+            || git clone --depth=1 "${{ inputs.kernel_repo }}" \
+                 "$GITHUB_WORKSPACE/oplus/kernel/msm-4.19"
+          cd "$GITHUB_WORKSPACE/oplus/kernel/msm-4.19"
+          git log -1 --oneline
+          grep -m1 -E '^VERSION|^PATCHLEVEL|^SUBLEVEL' Makefile || true
+          echo "--- 内核版本 ---"
+          head -5 Makefile
+
+      # ----------------------------------------------------------------------
+      # 3. 工具链: 使用 AOSP Clang + GCC 交叉编译器
+      #    注意 proton-clang 仓库只是包装, 直接 clone 得不到 bin/clang,
+      #    必须走它自己的 setup 或者直接下 AOSP prebuilt。
+      # ----------------------------------------------------------------------
+      - name: 3.1 下载 AOSP Clang (r487747c, 已验证兼容 4.19/sm8250)
+        run: |
+          set -eux
+          mkdir -p "$GITHUB_WORKSPACE/toolchains"
+          cd "$GITHUB_WORKSPACE/toolchains"
+          aria2c -q -x16 -s16 -o clang.tar.gz \
+            "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/clang-r487747c.tar.gz" \
+            || curl -LSs -o clang.tar.gz \
+            "https://github.com/kdrag0n/proton-clang/releases/latest/download/proton-clang.tar.gz"
+          mkdir -p clang
+          tar -xzf clang.tar.gz -C clang
+          rm -f clang.tar.gz
+          ls clang/bin/ | head -20
+          ./clang/bin/clang --version
+
+      - name: 3.2 下载 AArch64 / ARM32 GCC 交叉编译器 (binutils + 32bit 支持)
+        run: |
+          set -eux
+          cd "$GITHUB_WORKSPACE/toolchains"
+          git clone --depth=1 https://github.com/arter97/arm64-gcc.git gcc64
+          git clone --depth=1 https://github.com/arter97/arm32-gcc.git gcc32
+          ls gcc64/bin/ | head
+          ls gcc32/bin/ | head
+
+      # ----------------------------------------------------------------------
+      # 4. 修正 OPLUS 源码深层相对 include
+      #    关键修正: 上一版把整个 #include 替换成 "#include <>" 直接废源码。
+      #    这里改为把 "../../../kernel/xxx.h" 归一化成 "xxx.h",
+      #    因为 msm-4.19 已经是相对层级中的最后一跳。
+      # ----------------------------------------------------------------------
+      - name: 4.1 归一化 OPLUS 深层相对 include
+        working-directory: ${{ github.workspace }}/oplus/kernel/msm-4.19
+        run: |
+          python3 - <<'PYEOF'
+          import os, re, sys
+
+          root = os.getcwd()
+          # 匹配 #include "../../..(/..)*/kernel/msm-4.19/xxx.h" 以及
+          #      #include "../../../kernel/xxx.h" 两种形态
+          pat = re.compile(
+              r'#include\s*([<"])(?:\.\./)+kernel/(?:msm-4\.19/)?([^">\n]+)([>"])',
+              re.MULTILINE)
+
+          fixed_files = 0
+          fixed_hits = 0
+          for dirpath, dirnames, filenames in os.walk(root):
+              # 跳过 .git / 构建产物
+              dirnames[:] = [d for d in dirnames if d not in ('.git', 'out')]
+              for fn in filenames:
+                  if not fn.endswith(('.c', '.h', '.S', '.cpp', '.cc')):
+                      continue
+                  fpath = os.path.join(dirpath, fn)
+                  try:
+                      with open(fpath, 'r', encoding='utf-8', errors='ignore') as f:
+                          content = f.read()
+                  except Exception:
+                      continue
+                  if 'kernel/msm-4.19' not in content and '../kernel/' not in content:
+                      continue
+                  # 重写为同一源码树根起算的普通 include (去掉所有 ../kernel 前缀)
+                  new_content, n = pat.subn(lambda m: '#include %s%s%s' % (m.group(1), m.group(2), m.group(3)), content)
+                  if n:
+                      with open(fpath, 'w', encoding='utf-8') as f:
+                          f.write(new_content)
+                      fixed_files += 1
+                      fixed_hits += n
+                      print('[FIX] %s  (%d 处)' % (os.path.relpath(fpath, root), n))
+          print('[OPLUS-Normalize] 文件 %d 个, include %d 处' % (fixed_files, fixed_hits))
+          PYEOF
+
+      # ----------------------------------------------------------------------
+      # 5. 集成 KernelSU 源码
+      # ----------------------------------------------------------------------
+      - name: 5.1 集成 KernelSU 源码 (非 GKI 分支)
+        working-directory: ${{ github.workspace }}/oplus/kernel/msm-4.19
+        run: |
+          set -eux
+          if [ "${{ inputs.ksu_variant }}" = "kernelsu-next" ]; then
+            echo ">>> KernelSU-Next (next 分支, 走 legacy 集成)"
+            curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" \
+              | bash -s legacy
+          else
+            echo ">>> 原版 KernelSU v0.9.5 (最后支持非 GKI 的版本)"
+            curl -LSs "https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh" \
+              | bash -s v0.9.5
+          fi
+          test -d KernelSU && echo "KernelSU 目录已就绪"
+          ls KernelSU/ | head -20
+
+      # ----------------------------------------------------------------------
+      # 6. 手动 syscall hook 补丁 (仅 manual 模式)
+      #    修正点: 
+      #      - heredoc 全部正确缩进到 YAML 块内
+      #      - 补丁锚点改为「函数签名之后的第一个 {」, 不依赖 argv/envp 具体类型
+      #      - 加入已打补丁检测, 幂等
+      #      - 匹配失败时打印上下文而不是静默退出
+      # ----------------------------------------------------------------------
+      - name: 6.1 注入 4.19 非 GKI 系统调用 Hook
+        if: ${{ inputs.hook_mode == 'manual' }}
+        working-directory: ${{ github.workspace }}/oplus/kernel/msm-4.19
+        run: |
+          cat > /tmp/ksu_patch.py <<'PYEOF'
+          import os, re, sys
+
+          OK, SKIP, FAIL = 0, 0, 0
+
+          def read(fp):
+              with open(fp, 'r', encoding='utf-8', errors='ignore') as f:
+                  return f.read()
+
+          def write(fp, s):
+              with open(fp, 'w', encoding='utf-8') as f:
+                  f.write(s)
+
+          def inject_block(fp, marker, anchor_re, header, inject, label):
+              """
+              anchor_re 必须捕获 (前面的函数签名 + 行尾的 '{')
+              header 插到文件最顶部 (extern 声明区)
+              inject 插到函数体第一个 '{' 之后
+              幂等: 文件已含 marker 则跳过
+              """
+              global OK, SKIP, FAIL
+              if not os.path.exists(fp):
+                  print('[FAIL] 文件不存在: %s' % fp)
+                  FAIL += 1
+                  return
+              src = read(fp)
+              if marker in src:
+                  print('[SKIP] %s 已含 %s' % (fp, marker))
+                  SKIP += 1
+                  return
+
+              new_src, n = re.subn(
+                  anchor_re,
+                  lambda m: m.group(0) + inject,
+                  src,
+                  count=1,
+                  flags=re.MULTILINE | re.DOTALL)
+              if n == 0:
+                  print('[FAIL] 未能匹配 %s 中的 %s 锚点 (%s)' % (fp, label, marker))
+                  for mm in re.finditer(r'\b%s\b' % re.escape(label.split('(')[0]), src):
+                      s = max(0, mm.start() - 250)
+                      print('  ...疑似上下文...')
+                      print(src[s:mm.start() + 500])
+                      break
+                  FAIL += 1
+                  return
+
+              if header not in new_src:
+                  new_src = header + new_src
+              write(fp, new_src)
+              print('[OK]   %s 注入 %s' % (fp, marker))
+              OK += 1
+
+          # ---------------- 1) fs/exec.c : do_execveat_common ----------------
+          inject_block(
+              'fs/exec.c',
+              'ksu_handle_execveat',
+              r'(static int do_execveat_common\s*\([^)]*\)\s*\{)',
+              '#ifdef CONFIG_KSU\n'
+              'extern bool ksu_execveat_hook __read_mostly;\n'
+              'extern int ksu_handle_execveat(int *fd, struct filename **filename_ptr, void *argv, void *envp, int *flags);\n'
+              'extern int ksu_handle_execveat_sucompat(int *fd, struct filename **filename_ptr, void *argv, void *envp, int *flags);\n'
+              '#endif\n\n',
+              '\n#ifdef CONFIG_KSU\n'
+              '\tif (unlikely(ksu_execveat_hook))\n'
+              '\t\tksu_handle_execveat(&fd, &filename, &argv, &envp, &flags);\n'
+              '\telse\n'
+              '\t\tksu_handle_execveat_sucompat(&fd, &filename, &argv, &envp, &flags);\n'
+              '#endif\n',
+              'do_execveat_common')
+
+          # ---------------- 2) fs/open.c : faccessat ----------------
+          # 4.19 标准: SYSCALL_DEFINE3(faccessat, int, dfd, const char __user *, filename, int, mode)
+          inject_block(
+              'fs/open.c',
+              'ksu_handle_faccessat',
+              r'(SYSCALL_DEFINE3\s*\(\s*faccessat\s*,[^)]*\)\s*\{)',
+              '#ifdef CONFIG_KSU\n'
+              'extern int ksu_handle_faccessat(int *dfd, const char __user **filename_user, int *mode, int *flags);\n'
+              '#endif\n\n',
+              '\n#ifdef CONFIG_KSU\n'
+              '\tksu_handle_faccessat(&dfd, &filename, &mode, NULL);\n'
+              '#endif\n',
+              'faccessat')
+
+          # ---------------- 2b) fs/open.c : faccessat2 (4.19 部分分支已回移) ----------------
+          _op = 'fs/open.c'
+          if not os.path.exists(_op):
+              print('[FAIL] 文件不存在: %s' % _op)
+              FAIL += 1
+          elif 'SYSCALL_DEFINE4(faccessat2' not in read(_op):
+              print('[N/A]  %s 无 faccessat2 (OPLUS 该分支未回移), 跳过' % _op)
+          elif 'ksu_handle_faccessat2' in read(_op):
+              print('[SKIP] %s 已含 ksu_handle_faccessat2' % _op)
+              SKIP += 1
+          else:
+              inject_block(
+                  _op,
+                  'ksu_handle_faccessat2',
+                  r'(SYSCALL_DEFINE4\s*\(\s*faccessat2\s*,[^)]*\)\s*\{)',
+                  '#ifdef CONFIG_KSU\n'
+                  'extern int ksu_handle_faccessat2(int *dfd, const char __user **filename_user, int *mode, int *flags);\n'
+                  '#endif\n\n',
+                  '\n#ifdef CONFIG_KSU\n'
+                  '\tksu_handle_faccessat2(&dfd, &filename, &mode, &flags);\n'
+                  '#endif\n',
+                  'faccessat2')
+
+          # ---------------- 3) fs/read_write.c : vfs_read ----------------
+          inject_block(
+              'fs/read_write.c',
+              'ksu_handle_vfs_read',
+              r'(ssize_t vfs_read\s*\([^)]*\)\s*\{)',
+              '#ifdef CONFIG_KSU\n'
+              'extern bool ksu_vfs_read_hook __read_mostly;\n'
+              'extern int ksu_handle_vfs_read(struct file **file_ptr, char __user **buf_ptr, size_t *count_ptr, loff_t **pos);\n'
+              '#endif\n\n',
+              '\n#ifdef CONFIG_KSU\n'
+              '\tif (unlikely(ksu_vfs_read_hook))\n'
+              '\t\tksu_handle_vfs_read(&file, &buf, &count, &pos);\n'
+              '#endif\n',
+              'vfs_read')
+
+          # ---------------- 4) fs/stat.c : vfs_statx ----------------
+          inject_block(
+              'fs/stat.c',
+              'ksu_handle_stat',
+              r'(int vfs_statx\s*\([^)]*\)\s*\{)',
+              '#ifdef CONFIG_KSU\n'
+              'extern int ksu_handle_stat(int *dfd, const char __user **filename_user, int *flags);\n'
+              '#endif\n\n',
+              '\n#ifdef CONFIG_KSU\n'
+              '\tksu_handle_stat(&dfd, &filename, &flags);\n'
+              '#endif\n',
+              'vfs_statx')
+
+          # ---------------- 5) kernel/reboot.c : reboot ----------------
+          # OPLUS 4.19 部分分支把最后参数名写成 argp 而非 arg, 这里自动捕获。
+          reboot_src_path = 'kernel/reboot.c'
+          if os.path.exists(reboot_src_path):
+              _rb = read(reboot_src_path)
+              _m = re.search(
+                  r'SYSCALL_DEFINE4\s*\(\s*reboot\s*,\s*int\s*,\s*magic1\s*,\s*int\s*,\s*magic2\s*,'
+                  r'\s*unsigned\s+int\s*,\s*cmd\s*,\s*void\s+__user\s*\*\s*,\s*(\w+)\s*\)',
+                  _rb, re.MULTILINE)
+              reboot_arg = _m.group(1) if _m else 'arg'
+              print('[INFO] reboot 第四参数名检测为: %s' % reboot_arg)
+              inject_block(
+                  reboot_src_path,
+                  'ksu_handle_sys_reboot',
+                  r'(SYSCALL_DEFINE4\s*\(\s*reboot\s*,[^)]*\)\s*\{)',
+                  '#ifdef CONFIG_KSU\n'
+                  'extern int ksu_handle_sys_reboot(int magic1, int magic2, unsigned int cmd, void __user **arg);\n'
+                  '#endif\n\n',
+                  '\n#ifdef CONFIG_KSU\n'
+                  '\tksu_handle_sys_reboot(magic1, magic2, cmd, &%s);\n' % reboot_arg +
+                  '#endif\n',
+                  'SYSCALL_DEFINE4(reboot')
+          else:
+              print('[FAIL] 文件不存在: kernel/reboot.c')
+              FAIL += 1
+
+          print('=== Hook 注入结果: OK=%d SKIP=%d FAIL=%d ===' % (OK, SKIP, FAIL))
+          sys.exit(1 if FAIL else 0)
+          PYEOF
+          python3 /tmp/ksu_patch.py
+
+      # ----------------------------------------------------------------------
+      # 7. defconfig 定位与 KernelSU 配置写入
+      # ----------------------------------------------------------------------
+      - name: 7.1 定位 kona defconfig
+        working-directory: ${{ github.workspace }}/oplus/kernel/msm-4.19
+        run: |
+          set -eux
+          echo ">>> arch/arm64/configs 实际内容:"
+          find arch/arm64/configs -type f | sort
+
+          if [ -n "${{ inputs.defconfig_override }}" ]; then
+            DEFCFG="${{ inputs.defconfig_override }}"
+          else
+            DEFCFG=""
+            for cand in \
+              "arch/arm64/configs/vendor/kona-perf_defconfig" \
+              "arch/arm64/configs/vendor/kona_defconfig" \
+              "arch/arm64/configs/kona-perf_defconfig" \
+              "arch/arm64/configs/kona_defconfig" \
+              "arch/arm64/configs/vendor/oplus_kona_defconfig" \
+              "arch/arm64/configs/vendor/oplus_defconfig"; do
+              if [ -f "$cand" ]; then DEFCFG="$cand"; break; fi
+            done
+            if [ -z "$DEFCFG" ]; then
+              DEFCFG=$(find arch/arm64/configs -type f -name '*kona*' | head -n1 || true)
+            fi
+          fi
+
+          if [ -z "$DEFCFG" ] || [ ! -f "$DEFCFG" ]; then
+            echo "::error:: 未能定位 kona defconfig, 请用 defconfig_override 手动指定"
+            exit 1
+          fi
+          echo ">>> 锁定 DEFCONFIG: $DEFCFG"
+          echo "DEFCFG=$DEFCFG" >> "$GITHUB_ENV"
+          # 传给 make 的相对 path (相对 arch/arm64/configs)
+          echo "DEFCFG_REL=${DEFCFG#arch/arm64/configs/}" >> "$GITHUB_ENV"
+
+      - name: 7.2 写入 KernelSU 配置项
+        working-directory: ${{ github.workspace }}/oplus/kernel/msm-4.19
+        run: |
+          set -eux
+          F="$DEFCFG"
+          grep -q 'CONFIG_KSU=y' "$F" || echo 'CONFIG_KSU=y' >> "$F"
+          grep -q 'CONFIG_OVERLAY_FS=y' "$F" || echo 'CONFIG_OVERLAY_FS=y' >> "$F"
+          grep -q 'CONFIG_KSU_MANUAL_HOOK' "$F" || echo 'CONFIG_KSU_MANUAL_HOOK=y' >> "$F"
+
+          if [ "${{ inputs.hook_mode }}" = "kprobe" ]; then
+            {
+              echo 'CONFIG_KPROBES=y'
+              echo 'CONFIG_HAVE_KPROBES=y'
+              echo 'CONFIG_KPROBE_EVENTS=y'
+              echo 'CONFIG_KSU_KPROBE_HOOKS=y'
+            } >> "$F"
+          else
+            {
+              echo '# CONFIG_KPROBES is not set'
+              echo '# CONFIG_KSU_KPROBE_HOOKS is not set'
+            } >> "$F"
+          fi
+          echo ">>> 追加后的 KernelSU 相关配置:"
+          grep -n 'CONFIG_KSU\|CONFIG_OVERLAY_FS\|CONFIG_KPROBE' "$F" || true
+
+      # ----------------------------------------------------------------------
+      # 8. 编译内核
+      # ----------------------------------------------------------------------
+      - name: 8.1 生成 .config
+        working-directory: ${{ github.workspace }}/oplus/kernel/msm-4.19
+        run: |
+          set -eux
+          export PATH="$GITHUB_WORKSPACE/toolchains/clang/bin:$PATH"
+          export ARCH=arm64
+          export SUBARCH=arm64
+          if [ "${{ inputs.use_ccache }}" = "true" ]; then
+            export CC="ccache clang"
+          fi
+          make O=out ARCH=arm64 "$DEFCFG_REL"
+          grep -E 'CONFIG_KSU|CONFIG_KPROBE|CONFIG_OVERLAY_FS' out/.config || true
+
+      - name: 8.2 编译 Image
+        working-directory: ${{ github.workspace }}/oplus/kernel/msm-4.19
+        run: |
+          set -eux
+          export PATH="$GITHUB_WORKSPACE/toolchains/clang/bin:$PATH"
+          export ARCH=arm64
+          export SUBARCH=arm64
+          export KBUILD_BUILD_USER="KSU"
+          export KBUILD_BUILD_HOST="RMX3370"
+          export TCBIN="$GITHUB_WORKSPACE/toolchains"
+          export CROSS_COMPILE="$TCBIN/gcc64/bin/aarch64-unknown-linux-gnu-"
+          export CROSS_COMPILE_ARM32="$TCBIN/gcc32/bin/arm-unknown-linux-gnueabi-"
+          export LD=ld.lld
+          export AR=llvm-ar
+          export NM=llvm-nm
+          export OBJCOPY=llvm-objcopy
+          export OBJDUMP=llvm-objdump
+          export STRIP=llvm-strip
+          export READELF=llvm-readelf
+
+          make -j"$(nproc --all)" O=out \
+            ARCH=arm64 \
+            CC=clang \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            CROSS_COMPILE="$CROSS_COMPILE" \
+            CROSS_COMPILE_ARM32="$CROSS_COMPILE_ARM32" \
+            LD=ld.lld AR=llvm-ar NM=llvm-nm \
+            OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump \
+            STRIP=llvm-strip READELF=llvm-readelf \
+            KCFLAGS="-Wno-error" 2>&1 | tail -200
+
+          echo ">>> 编译产物:"
+          ls -lh out/arch/arm64/boot/ || true
+
+      # ----------------------------------------------------------------------
+      # 9. 打包
+      # ----------------------------------------------------------------------
+      - name: 9.1 打包 AnyKernel3
+        working-directory: ${{ github.workspace }}/oplus/kernel/msm-4.19
+        run: |
+          set -eux
+          if [ ! -f out/arch/arm64/boot/Image ]; then
+            echo "::error:: 未生成 out/arch/arm64/boot/Image, 编译失败"
+            exit 1
+          fi
+
+          git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git "$GITHUB_WORKSPACE/AnyKernel3"
+          rm -rf "$GITHUB_WORKSPACE/AnyKernel3/.git"
+          cd "$GITHUB_WORKSPACE/AnyKernel3"
+
+          cat > anykernel.sh <<'EOF'
+          properties() { '
+          kernel.string=KernelSU Built-in Kernel for realme GT Neo2 (RMX3370 / RE5473)
+          do.devicecheck=0
+          do.modules=0
+          do.systemless=1
+          do.cleanup=1
+          do.cleanuponabort=0
+          supported.versions=
+          '; }
+
+          block=auto;
+          is_slot_device=auto;
+          ramdisk_compression=auto;
+          patch_vbmeta_flag=auto;
+
+          . tools/ak3-core.sh;
+
+          dump_boot;
+          write_boot;
+          EOF
+
+          cp "$GITHUB_WORKSPACE/oplus/kernel/msm-4.19/out/arch/arm64/boot/Image" ./
+          for extra in dtbo.img dtb.img; do
+            if [ -f "$GITHUB_WORKSPACE/oplus/kernel/msm-4.19/out/arch/arm64/boot/$extra" ]; then
+              cp "$GITHUB_WORKSPACE/oplus/kernel/msm-4.19/out/arch/arm64/boot/$extra" ./
+            fi
+          done
+
+          mkdir -p "$GITHUB_WORKSPACE/release_out"
+          cp Image "$GITHUB_WORKSPACE/release_out/Image"
+          cp "$GITHUB_WORKSPACE/oplus/kernel/msm-4.19/out/arch/arm64/boot/Image" \
+             "$GITHUB_WORKSPACE/release_out/Image-raw" 2>/dev/null || true
+
+          PKG="AnyKernel3-RMX3370-RealmeUI4-KSU-${{ inputs.ksu_variant }}-${{ inputs.hook_mode }}.zip"
+          zip -r9 "$GITHUB_WORKSPACE/release_out/$PKG" . -x '.git/*' 'README.md' '*placeholder'
+          ls -lh "$GITHUB_WORKSPACE/release_out/"
+
+      - name: 9.2 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: RMX3370-RealmeUI4-KernelSU-${{ inputs.ksu_variant }}-${{ inputs.hook_mode }}
+          path: ${{ github.workspace }}/release_out/*
+          retention-days: 30
