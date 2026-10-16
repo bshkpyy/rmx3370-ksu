@@ -62,7 +62,6 @@ jobs:
           fi
           echo "KERNEL_COMMIT=$(git rev-parse HEAD)" | tee "$GITHUB_WORKSPACE/kernel_commit.txt"
 
-          # 建立 OPLUS 标准目录软链接，解决 ../../../../kernel/msm-4.19 跨目录引用
           ln -sfn "$GITHUB_WORKSPACE/oplus_src/kernel" "$GITHUB_WORKSPACE/kernel" || true
           ln -sfn "$GITHUB_WORKSPACE/oplus_src/kernel/msm-4.19" "$GITHUB_WORKSPACE/oplus_src/kernel/msm-5.4" || true
 
@@ -82,52 +81,102 @@ jobs:
           "$GITHUB_WORKSPACE/toolchains/clang/bin/clang" --version
           "$GITHUB_WORKSPACE/toolchains/gcc64/bin/aarch64-linux-android-ld" --version
 
-      - name: "4. 修复 gcc-wrapper.py、OplusKernelEnvConfig.mk、损坏软链接与缺失 Kconfig (不修改 kernel/module.c)"
+      - name: "4. 清理全仓 Windows 文本假软链接、补齐 sched_assist 等头文件与 Kconfig (不修改 kernel/module.c)"
         working-directory: ${{ github.workspace }}/oplus_src/kernel/msm-4.19
         run: |
           python3 - << 'EOF'
-          import os, re, shutil
+          import os, re, shutil, traceback
 
           root = os.getcwd()
 
-          # 1. 将 scripts/gcc-wrapper.py 替换为合法的直接透传脚本 (彻底解决 def pass: SyntaxError 与 init/Kconfig:16-17 报错)
+          def safe_makedirs(d):
+              # 创建目录前自动移除路径上任何阻挡目录创建的损坏软链接或 Windows 文本假软链接文件
+              rel = os.path.relpath(d, root)
+              if rel == "." or rel.startswith(".."):
+                  os.makedirs(d, exist_ok=True)
+                  return
+              cur = root
+              for part in rel.split(os.sep):
+                  if not part or part == ".":
+                      continue
+                  cur = os.path.join(cur, part)
+                  if os.path.islink(cur) and not os.path.exists(cur):
+                      print(f"[SafeMakedirs] 移除损坏软链接: {os.path.relpath(cur, root)}")
+                      os.unlink(cur)
+                  elif os.path.exists(cur) and not os.path.isdir(cur):
+                      print(f"[SafeMakedirs] 移除阻挡目录创建的非目录文件(假软链接): {os.path.relpath(cur, root)}")
+                      os.unlink(cur)
+              os.makedirs(d, exist_ok=True)
+
+          # 1. 将 scripts/gcc-wrapper.py 替换为直接透传脚本
           gw_path = os.path.join(root, "scripts/gcc-wrapper.py")
-          if os.path.exists(gw_path):
+          if os.path.exists(gw_path) or os.path.islink(gw_path):
+              if os.path.islink(gw_path):
+                  os.unlink(gw_path)
               with open(gw_path, "w", encoding="utf-8") as f:
                   f.write("#!/usr/bin/env python3\nimport os, sys\nos.execvp(sys.argv[1], sys.argv[1:])\n")
               os.chmod(gw_path, 0o755)
-              print("[Fix 1] 已将 scripts/gcc-wrapper.py 替换为编译器直接透传脚本。")
+              print("[Fix 1] 已替换 scripts/gcc-wrapper.py 为直接透传脚本。")
 
-          # 2. 修复 OplusKernelEnvConfig.mk 中的 awk 负索引 ($(NF-1) / $(NF-2)) 与 wakelock_profiler_h 软链接报错
-          oplus_env = os.path.join(root, "OplusKernelEnvConfig.mk")
-          if os.path.exists(oplus_env):
-              with open(oplus_env, "r", encoding="utf-8", errors="ignore") as f:
-                  env_content = f.read()
-              env_content = re.sub(r'\$\(\s*NF\s*-\s*([0-9]+)\s*\)', r'(NF>\1?$(NF-\1):$1)', env_content)
-              with open(oplus_env, "w", encoding="utf-8") as f:
-                  f.write(env_content)
-              print("[Fix 2] 已修复 OplusKernelEnvConfig.mk 中的 awk 负字段索引报错。")
-
+          # 2. 全仓扫描并清理被提交为普通单行文本文件的“Windows 假软链接” (涵盖 include/, kernel/, drivers/, arch/ 等所有目录)
+          text_symlinks = []
           for dirpath, _, filenames in os.walk(root):
-              if "wakelock_profiler_qcom.h" in filenames:
-                  src_h = os.path.join(dirpath, "wakelock_profiler_qcom.h")
-                  dst_h = os.path.join(dirpath, "wakelock_profiler.h")
-                  if os.path.islink(dst_h) and not os.path.exists(dst_h):
-                      os.unlink(dst_h)
-                  if not os.path.exists(dst_h):
-                      shutil.copyfile(src_h, dst_h)
-                      print(f"[Fix 2b] 已补齐 {os.path.relpath(dst_h, root)}")
+              if ".git" in dirpath:
+                  continue
+              for fn in filenames:
+                  fpath = os.path.join(dirpath, fn)
+                  if not os.path.islink(fpath) and os.path.isfile(fpath):
+                      sz = os.path.getsize(fpath)
+                      if 0 < sz < 260 and fn not in ("Makefile", "Kconfig", "Kbuild", "README", "LICENSE", ".gitignore", "localversion"):
+                          try:
+                              with open(fpath, "rb") as bf:
+                                  raw = bf.read()
+                              if b"\x00" not in raw:
+                                  txt = raw.decode("utf-8", errors="ignore").strip()
+                                  # 单行相对路径特征：不包含空格、分号、等号、井号、括号，且包含 ../ 或 /
+                                  if "\n" not in txt and ("../" in txt or "/" in txt) and not any(c in txt for c in (" ", ";", "=", "#", "(", ")", "{", "}", "<", ">", '"')):
+                                      text_symlinks.append((fpath, txt))
+                          except Exception:
+                              pass
 
-          # 3. 索引全仓真实存在的目录和文件，自动修复欧加开源仓库中的损坏软链接 (如 kernel/sched_assist 等)
+          for fpath, target_txt in text_symlinks:
+              rel_f = os.path.relpath(fpath, root)
+              resolved = os.path.normpath(os.path.join(os.path.dirname(fpath), target_txt))
+              os.unlink(fpath)
+              if os.path.exists(resolved):
+                  os.symlink(resolved, fpath)
+                  print(f"[Text Symlink Restored] {rel_f} -> {os.path.relpath(resolved, root)}")
+              else:
+                  print(f"[Broken Text Symlink Removed] 已删除指向不存在路径的假软链接文件: {rel_f} (原内容: {target_txt})")
+
+          # 3. 索引全仓真实存在的所有目录和文件
           real_dirs = {}
-          for dirpath, dirnames, _ in os.walk(root):
+          real_files = {}
+          for dirpath, dirnames, filenames in os.walk(root):
               if ".git" in dirpath:
                   continue
               for d in dirnames:
                   full_d = os.path.join(dirpath, d)
-                  if not os.path.islink(full_d):
+                  if not os.path.islink(full_d) and os.path.isdir(full_d):
                       real_dirs.setdefault(d, []).append(full_d)
+              for fn in filenames:
+                  full_f = os.path.join(dirpath, fn)
+                  if not os.path.islink(full_f) and os.path.isfile(full_f):
+                      real_files.setdefault(fn, []).append(full_f)
 
+          print(f"[Index] 已索引真实目录 {len(real_dirs)} 个，真实文件 {len(real_files)} 个 (sched_assist_mutex.h 是否在仓内: {'sched_assist_mutex.h' in real_files})。")
+
+          # 4. 补齐 wakelock_profiler.h
+          if "wakelock_profiler_qcom.h" in real_files:
+              for src_h in real_files["wakelock_profiler_qcom.h"]:
+                  dst_h = os.path.join(os.path.dirname(src_h), "wakelock_profiler.h")
+                  if os.path.islink(dst_h):
+                      os.unlink(dst_h)
+                  if not os.path.exists(dst_h):
+                      shutil.copyfile(src_h, dst_h)
+                      real_files.setdefault("wakelock_profiler.h", []).append(dst_h)
+
+          # 5. 处理全仓损坏的 Unix 软链接
           for dirpath, dirnames, filenames in os.walk(root):
               if ".git" in dirpath:
                   continue
@@ -137,21 +186,118 @@ jobs:
                       raw_target = os.readlink(full_p)
                       base_target = os.path.basename(raw_target.rstrip("/"))
                       os.unlink(full_p)
-                      candidates = real_dirs.get(base_target) or real_dirs.get(name) or []
-                      if len(candidates) == 1:
-                          os.symlink(candidates[0], full_p)
-                          print(f"[Symlink Re-linked] {os.path.relpath(full_p, root)} -> {os.path.relpath(candidates[0], root)}")
+                      if name in real_files:
+                          shutil.copyfile(real_files[name][0], full_p)
+                          print(f"[Unix File Link Restored] {os.path.relpath(full_p, root)} <= {os.path.relpath(real_files[name][0], root)}")
+                      elif base_target in real_files:
+                          shutil.copyfile(real_files[base_target][0], full_p)
+                          print(f"[Unix File Link Restored] {os.path.relpath(full_p, root)} <= {os.path.relpath(real_files[base_target][0], root)}")
                       else:
-                          # 若原软链接指向的是源码包未开源的目录，创建包含空 Kconfig 和 Makefile 的占位目录
-                          if not os.path.splitext(name)[1]:
-                              os.makedirs(full_p, exist_ok=True)
+                          cands = [d for d in (real_dirs.get(name) or real_dirs.get(base_target) or []) if os.path.exists(d)]
+                          if len(cands) >= 1 and base_target not in ("include", "kernel", "drivers", "common", "core"):
+                              os.symlink(cands[0], full_p)
+                              print(f"[Unix Dir Link Restored] {os.path.relpath(full_p, root)} -> {os.path.relpath(cands[0], root)}")
+                          elif not os.path.splitext(name)[1] and not full_p.startswith(os.path.join(root, "include")):
+                              safe_makedirs(full_p)
                               with open(os.path.join(full_p, "Kconfig"), "w") as kf:
                                   kf.write(f"# Stub Kconfig for {name}\n")
                               with open(os.path.join(full_p, "Makefile"), "w") as mf:
                                   mf.write(f"# Stub Makefile for {name}\n")
-                              print(f"[Symlink Stubbed] 已将未开源的损坏目录软链接替换为空占位目录: {os.path.relpath(full_p, root)}")
+                              print(f"[Unix Dir Link Stubbed] {os.path.relpath(full_p, root)}")
 
-          # 4. 多轮扫描全仓所有 Kconfig* 文件中的 source "..." 语句，确保没有任何缺失的 Kconfig 导致 conf 报错
+          # 6. 全仓扫描所有 .c / .h 中的 #include <...> 引用，使用 safe_makedirs 补齐缺失头文件或复制同目录全部头文件
+          include_dirs = [
+              os.path.join(root, "include"),
+              os.path.join(root, "arch/arm64/include"),
+              os.path.join(root, "arch/arm64/include/uapi"),
+              os.path.join(root, "include/uapi"),
+              root,
+          ]
+          inc_re = re.compile(r'^\s*#\s*include\s+<([^>]+)>', re.MULTILINE)
+          macro_guard_re = re.compile(r'(OPLUS_FEATURE_[A-Z0-9_]+|CONFIG_OPLUS_[A-Z0-9_]+)')
+          missing_headers = set()
+          broken_oplus_macros = set()
+          resolved_headers = 0
+
+          for dirpath, _, filenames in os.walk(root):
+              if ".git" in dirpath or "Documentation" in dirpath or "scripts" in dirpath:
+                  continue
+              for fn in filenames:
+                  if fn.endswith((".c", ".h")):
+                      fpath = os.path.join(dirpath, fn)
+                      try:
+                          with open(fpath, "r", encoding="utf-8", errors="ignore") as f:
+                              content = f.read()
+                          if "../../../kernel" in content:
+                              content = re.sub(r'#include\s+["<](?:\.\./)+kernel/(?:msm-[0-9.]+/)?([^">]+)[">]', r'#include <\1>', content)
+                              with open(fpath, "w", encoding="utf-8") as wf:
+                                  wf.write(content)
+                          for m in inc_re.finditer(content):
+                              inc_rel = m.group(1).strip()
+                              if "/" in inc_rel and any(k in inc_rel for k in ("sched_assist", "oplus", "wakelock", "special_opt", "ux_", "healthinfo", "hans", "im.h", "tpd", "Revert", "soc/oplus")):
+                                  if not any(os.path.isfile(os.path.join(idir, inc_rel)) for idir in include_dirs):
+                                      bname = os.path.basename(inc_rel)
+                                      dst_f = os.path.join(root, "include", inc_rel)
+                                      dst_dir = os.path.dirname(dst_f)
+                                      safe_makedirs(dst_dir)
+                                      if bname in real_files:
+                                          src_file = real_files[bname][0]
+                                          src_dir = os.path.dirname(src_file)
+                                          # 将该头文件所在目录的所有 .h 一并复制到目标 include 子目录，防止连带头文件缺失
+                                          for sfn in os.listdir(src_dir):
+                                              if sfn.endswith(".h"):
+                                                  sp = os.path.join(src_dir, sfn)
+                                                  dp = os.path.join(dst_dir, sfn)
+                                                  if os.path.isfile(sp) and not os.path.exists(dp):
+                                                      shutil.copyfile(sp, dp)
+                                                      resolved_headers += 1
+                                          if not os.path.isfile(dst_f):
+                                              shutil.copyfile(src_file, dst_f)
+                                              resolved_headers += 1
+                                          print(f"[Header Copied] 已将 {os.path.relpath(src_file, root)} (及同目录头文件) 复制到 include/{inc_rel}")
+                                      else:
+                                          missing_headers.add(inc_rel)
+                                          start_pos = max(0, m.start() - 400)
+                                          context_before = content[start_pos : m.start()]
+                                          for gm in macro_guard_re.finditer(context_before):
+                                              broken_oplus_macros.add(gm.group(1))
+                      except Exception as e:
+                          print(f"[ERROR] 处理头文件引用 {fpath} 异常: {e}")
+                          traceback.print_exc()
+
+          for inc_rel in sorted(missing_headers):
+              dst_f = os.path.join(root, "include", inc_rel)
+              safe_makedirs(os.path.dirname(dst_f))
+              if not os.path.isfile(dst_f):
+                  guard = "STUB_" + re.sub(r"[^A-Za-z0-9_]", "_", inc_rel.upper())
+                  with open(dst_f, "w", encoding="utf-8") as hf:
+                      hf.write(f"#ifndef {guard}\n#define {guard}\n/* Auto-generated stub for {inc_rel} */\n#endif\n")
+                  print(f"[Header Stub Created] include/{inc_rel}")
+
+          # 强制兜底检查 include/linux/sched_assist/sched_assist_mutex.h 必须存在且为可读文件
+          sa_mutex_h = os.path.join(root, "include/linux/sched_assist/sched_assist_mutex.h")
+          if not os.path.isfile(sa_mutex_h):
+              safe_makedirs(os.path.dirname(sa_mutex_h))
+              if "sched_assist_mutex.h" in real_files:
+                  shutil.copyfile(real_files["sched_assist_mutex.h"][0], sa_mutex_h)
+              else:
+                  with open(sa_mutex_h, "w", encoding="utf-8") as hf:
+                      hf.write("#ifndef _OPLUS_SCHED_ASSIST_MUTEX_H_\n#define _OPLUS_SCHED_ASSIST_MUTEX_H_\n#endif\n")
+          print(f"[Verify] include/linux/sched_assist/sched_assist_mutex.h exists={os.path.isfile(sa_mutex_h)}, size={os.path.getsize(sa_mutex_h)}")
+
+          # 7. 修复 OplusKernelEnvConfig.mk
+          oplus_env = os.path.join(root, "OplusKernelEnvConfig.mk")
+          if os.path.exists(oplus_env):
+              with open(oplus_env, "r", encoding="utf-8", errors="ignore") as f:
+                  env_content = f.read()
+              env_content = re.sub(r'\$\(\s*NF\s*-\s*([0-9]+)\s*\)', r'(NF>\1?$(NF-\1):$1)', env_content)
+              for macro in sorted(broken_oplus_macros):
+                  if macro in env_content:
+                      env_content = re.sub(r'\b' + re.escape(macro) + r'\b', 'DISABLED_UNSHIPPED_' + macro, env_content)
+              with open(oplus_env, "w", encoding="utf-8") as f:
+                  f.write(env_content)
+
+          # 8. 多轮扫描全仓所有 Kconfig* 文件，清理 CRLF 并使用 safe_makedirs 补齐缺失的 Kconfig
           source_re = re.compile(r'^\s*source\s+"([^"]+)"', re.MULTILINE)
           for _pass in range(4):
               fixed_in_pass = 0
@@ -173,84 +319,45 @@ jobs:
                                   abs_target = os.path.join(root, rel_target)
                                   if not os.path.isfile(abs_target):
                                       target_dir = os.path.dirname(abs_target)
-                                      sub_name = os.path.basename(target_dir)
-                                      cands = [d for d in real_dirs.get(sub_name, []) if os.path.isfile(os.path.join(d, os.path.basename(abs_target)))]
-                                      if len(cands) == 1 and not os.path.exists(target_dir):
-                                          os.makedirs(os.path.dirname(target_dir), exist_ok=True)
-                                          os.symlink(cands[0], target_dir)
-                                          print(f"[Kconfig Link] {rel_target} -> {os.path.relpath(cands[0], root)}")
-                                      else:
-                                          if os.path.exists(target_dir) and not os.path.isdir(target_dir):
-                                              os.unlink(target_dir)
-                                          os.makedirs(target_dir, exist_ok=True)
-                                          with open(abs_target, "w", encoding="utf-8") as kf:
-                                              kf.write(f"# Auto-generated stub for missing {rel_target}\n")
-                                          mk_stub = os.path.join(target_dir, "Makefile")
-                                          if not os.path.exists(mk_stub):
-                                              with open(mk_stub, "w", encoding="utf-8") as mf:
-                                                  mf.write("# Auto-generated stub Makefile\n")
-                                          print(f"[Kconfig Stub] 已补齐缺失的 {rel_target}")
+                                      safe_makedirs(target_dir)
+                                      with open(abs_target, "w", encoding="utf-8") as kf:
+                                          kf.write(f"# Auto-generated stub for missing {rel_target}\n")
+                                      mk_stub = os.path.join(target_dir, "Makefile")
+                                      if not os.path.exists(mk_stub):
+                                          with open(mk_stub, "w", encoding="utf-8") as mf:
+                                              mf.write("# Auto-generated stub Makefile\n")
+                                      print(f"[Kconfig Stub] 已补齐缺失的 {rel_target}")
                                       fixed_in_pass += 1
                           except Exception as e:
                               print(f"[WARN] 扫描 {kpath} 异常: {e}")
               if fixed_in_pass == 0:
                   break
 
-          # 5. 检查 drivers 下是否存在被保存为单行文本文件的损坏目录软链接 (如 adapter_ic)
-          for dirpath, _, filenames in os.walk(os.path.join(root, "drivers")):
-              for fn in filenames:
-                  fpath = os.path.join(dirpath, fn)
-                  if not os.path.islink(fpath) and os.path.isfile(fpath) and os.path.getsize(fpath) < 120:
-                      if "." not in fn and fn not in ("Makefile", "Kconfig", "Kbuild", "README", "LICENSE"):
-                          with open(fpath, "r", encoding="utf-8", errors="ignore") as f:
-                              txt = f.read().strip()
-                          if "\n" not in txt and ("/" in txt or txt.startswith("..")):
-                              resolved = os.path.normpath(os.path.join(dirpath, txt))
-                              os.unlink(fpath)
-                              if os.path.exists(resolved):
-                                  os.symlink(resolved, fpath)
-                                  print(f"[Restored Text Symlink] {os.path.relpath(fpath, root)} -> {txt}")
-                              else:
-                                  os.makedirs(fpath, exist_ok=True)
-                                  with open(os.path.join(fpath, "Makefile"), "w") as mf:
-                                      mf.write("# Stub Makefile\n")
-                                  with open(os.path.join(fpath, "Kconfig"), "w") as kf:
-                                      kf.write("# Stub Kconfig\n")
-                                  print(f"[Stubbed Text Symlink] {os.path.relpath(fpath, root)}")
-
-          # 6. 修正欧加驱动中超出仓库根目录的 ../../../../kernel/ 相对引用
-          pattern = re.compile(r'#include\s+["<](?:\.\./)+kernel/(?:msm-[0-9.]+/)?([^">]+)[">]')
-          fixed_includes = 0
-          for dirpath, _, filenames in os.walk(root):
-              if '.git' in dirpath:
-                  continue
-              for fn in filenames:
-                  if fn.endswith(('.c', '.h', '.S')):
-                      fpath = os.path.join(dirpath, fn)
-                      try:
-                          with open(fpath, 'r', encoding='utf-8', errors='ignore') as f:
-                              content = f.read()
-                          if '../../../kernel' in content:
-                              new_content, n = pattern.subn(r'#include <\1>', content)
-                              if n > 0:
-                                  with open(fpath, 'w', encoding='utf-8') as f:
-                                      f.write(new_content)
-                                  fixed_includes += n
-                      except Exception:
-                          pass
-          print(f"[OPLUS Path] 已修正 {fixed_includes} 处跨层级头文件引用；kernel/module.c 保持 100% 原厂未修改。")
-
-          # 7. 在顶层 Makefile 增加 -I$(srctree) 并清理子目录 -Werror
+          # 9. 在顶层 Makefile 移除 Clang 10 不支持的 GCC 警告选项 (含 -Wno-undefined-optimized)，并清理子目录 -Werror
           makefile_path = os.path.join(root, "Makefile")
           with open(makefile_path, "r", encoding="utf-8", errors="ignore") as f:
               mk = f.read()
           mk = mk.replace("-Werror", "-Wno-error")
+          for bad_flag in (
+              "-Wno-undefined-optimized",
+              "-Wno-psabi",
+              "-Wno-frame-address",
+              "-Wno-format-truncation",
+              "-Wno-format-overflow",
+              "-Wno-stringop-truncation",
+              "-Wno-zero-length-bounds",
+              "-Wno-stringop-overflow",
+              "-Wno-restrict",
+              "-Wno-maybe-uninitialized",
+              "-Wno-packed-not-aligned",
+              "-Wno-pointer-to-enum-cast",
+          ):
+              mk = mk.replace(bad_flag, "")
           mk += (
-              "\n# OPLUS root include path & warning tolerance\n"
-              "KBUILD_CFLAGS += -I$(srctree) -I$(srctree)/include -Wno-error "
-              "-Wno-unused-but-set-variable -Wno-frame-larger-than -Wno-implicit-fallthrough "
-              "-Wno-misleading-indentation -Wno-format -Wno-enum-conversion "
-              "-Wno-deprecated-declarations -Wno-array-bounds\n"
+              "\n# OPLUS root include path & Clang 10 warning tolerance\n"
+              "KBUILD_CFLAGS := -Wno-unknown-warning-option $(KBUILD_CFLAGS) -I$(srctree) -I$(srctree)/include -Wno-error "
+              "-Wno-deprecated-declarations -Wno-format -Wno-enum-conversion -Wno-array-bounds\n"
+              "HOSTCFLAGS += -Wno-deprecated-declarations\n"
           )
           with open(makefile_path, "w", encoding="utf-8") as f:
               f.write(mk)
@@ -264,8 +371,9 @@ jobs:
                       try:
                           with open(fpath, 'r', encoding='utf-8', errors='ignore') as f:
                               c = f.read()
-                          if '-Werror' in c:
+                          if '-Werror' in c or '-Wno-undefined-optimized' in c:
                               c2 = re.sub(r'(?<![a-zA-Z0-9_-])-Werror(?![=a-zA-Z0-9_-])', '-Wno-error', c)
+                              c2 = c2.replace('-Wno-undefined-optimized', '')
                               if c2 != c:
                                   with open(fpath, 'w', encoding='utf-8') as f:
                                       f.write(c2)
