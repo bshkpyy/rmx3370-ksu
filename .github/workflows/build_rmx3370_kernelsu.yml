@@ -164,6 +164,10 @@ jobs:
                           try:
                               with open(kpath, "r", encoding="utf-8", errors="ignore") as f:
                                   kcontent = f.read()
+                              if "\r" in kcontent:
+                                  kcontent = kcontent.replace("\r\n", "\n").replace("\r", "\n")
+                                  with open(kpath, "w", encoding="utf-8") as wf:
+                                      wf.write(kcontent)
                               for m in source_re.finditer(kcontent):
                                   rel_target = m.group(1).strip()
                                   abs_target = os.path.join(root, rel_target)
@@ -515,7 +519,7 @@ jobs:
 
           cat > scripts/setlocalversion << 'EOF'
           #!/bin/sh
-          printf "+"
+          printf "%s" "-perf+"
           EOF
           chmod +x scripts/setlocalversion
 
@@ -539,7 +543,7 @@ jobs:
             -d WERROR || true
           make "${COMMON_ARGS[@]}" olddefconfig
 
-          REL=$(make -s "${COMMON_ARGS[@]}" kernelrelease)
+          REL=$(make -s "${COMMON_ARGS[@]}" kernelrelease 2>/dev/null | tail -n 1 | tr -d '\r')
           echo ">>> 预检 kernelrelease: '$REL'"
           if [ "$REL" != "4.19.157-perf+" ]; then
             echo "[ERROR] kernelrelease ('$REL') 不等于 '4.19.157-perf+'！"
